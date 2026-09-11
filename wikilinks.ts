@@ -34,6 +34,36 @@ function compareCandidates(a: string, b: string): number {
   return depthDifference || a.localeCompare(b);
 }
 
+/**
+ * Where a reference would live if nothing matches it. Callers holding a
+ * complete index use this instead of rescanning every path for a known miss.
+ */
+export function wikilinkFallbackPath(
+  reference: string,
+  currentPath: string,
+): string {
+  const requestedFile = stripSubpath(normalizeWikilinkReference(reference));
+  if (requestedFile === "") return currentPath.replace(/\\/g, "/");
+  const slashRequested = requestedFile.replace(/\\/g, "/");
+  const directRequest = withLinkableExtension(
+    path.posix
+      .normalize(slashRequested.replace(/^\/+/, ""))
+      .replace(/^(?:\.\.\/)+/, ""),
+  );
+  const relativeRequest = withLinkableExtension(
+    path.posix.normalize(
+      path.posix.join(
+        path.posix.dirname(currentPath.replace(/\\/g, "/")),
+        slashRequested,
+      ),
+    ),
+  );
+  return !relativeRequest.startsWith("../") &&
+    !path.posix.isAbsolute(relativeRequest)
+    ? relativeRequest
+    : directRequest;
+}
+
 export function resolveWikilinkPath(
   reference: string,
   currentPath: string,

@@ -486,6 +486,12 @@
   line-height: 1.55;
 }
 
+.wikilink-hover-focus {
+  border-radius: 0.3rem;
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--primary) 12%, transparent);
+}
+
 .wikilink-tldraw-preview {
   display: block;
   width: 100%;
@@ -619,6 +625,20 @@
   color: var(--popover-foreground);
   box-shadow: 0 14px 38px color-mix(in srgb, var(--ink) 20%, transparent);
   animation: wikilink-hover-in 100ms ease-out;
+}
+
+/* Inside the live note editor the menu sits at the caret, not above a box. */
+.wikilinks-live-editor {
+  position: relative;
+}
+
+.wikilink-autocomplete-caret {
+  top: 0;
+  right: auto;
+  bottom: auto;
+  left: 0;
+  width: 22rem;
+  max-width: 100%;
 }
 
 .wikilink-autocomplete-heading,

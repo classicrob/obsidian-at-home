@@ -3,6 +3,8 @@ import {
   decodeLocalMarkdownPath,
   decodeWikilinkUrl,
   extractLocalMarkdownPaths,
+  parseWikilinkSubpath,
+  remarkBlockAnchors,
   splitWikilinkText,
   WIKILINK_URL_PREFIX,
 } from "./wikilink-markdown.js";
@@ -11,9 +13,9 @@ describe("local Markdown paths", () => {
   it("decodes absolute, relative, file URL, and tldraw links", () => {
     expect(
       decodeLocalMarkdownPath(
-        "/Users/me/Notes/Example%20document.md",
+        "/Users/me/Notes/Continual%20learning.md",
       ),
-    ).toBe("/Users/me/Notes/Example document.md");
+    ).toBe("/Users/me/Notes/Continual learning.md");
     expect(decodeLocalMarkdownPath("../Concepts/Learning.markdown#definition")).toBe(
       "../Concepts/Learning.markdown",
     );
@@ -22,9 +24,9 @@ describe("local Markdown paths", () => {
     );
     expect(
       decodeLocalMarkdownPath(
-        "examples/Team%20workshops%20(whiteboard).tldraw",
+        "websim/I-%20Prompt%20arenas%20into%20existence%20(whiteboard).tldraw",
       ),
-    ).toBe("examples/Team workshops (whiteboard).tldraw");
+    ).toBe("websim/I- Prompt arenas into existence (whiteboard).tldraw");
   });
 
   it("rejects web links and extracts unique local note destinations", () => {
@@ -39,10 +41,10 @@ describe("local Markdown paths", () => {
   it("extracts tldraw destinations containing balanced parentheses", () => {
     expect(
       extractLocalMarkdownPaths(
-        "[the workshop whiteboard](examples/Team%20workshops%20(whiteboard).tldraw)",
+        "[the arenas whiteboard](websim/I-%20Prompt%20arenas%20into%20existence%20(whiteboard).tldraw)",
       ),
     ).toEqual([
-      "examples/Team workshops (whiteboard).tldraw",
+      "websim/I- Prompt arenas into existence (whiteboard).tldraw",
     ]);
   });
 });
@@ -77,5 +79,73 @@ describe("decodeWikilinkUrl", () => {
     expect(
       decodeWikilinkUrl(`${WIKILINK_URL_PREFIX}${encodeURIComponent(reference)}`),
     ).toBe(reference);
+  });
+});
+
+describe("wikilink subpaths", () => {
+  it("parses block and heading subpaths, ignoring aliases", () => {
+    expect(parseWikilinkSubpath("Note")).toBeNull();
+    expect(parseWikilinkSubpath("Note#^t-00-12-30|12:30")).toEqual({
+      kind: "block",
+      id: "t-00-12-30",
+    });
+    expect(parseWikilinkSubpath("Note#Key  *Decisions*|x")).toEqual({
+      kind: "heading",
+      text: "key decisions",
+    });
+    expect(parseWikilinkSubpath("Note#A#B")).toEqual({ kind: "heading", text: "b" });
+    expect(parseWikilinkSubpath("Note#^")).toBeNull();
+  });
+
+  it("tags block anchors and headings and hides the marker text", () => {
+    const tree = {
+      type: "root",
+      children: [
+        {
+          type: "heading",
+          depth: 2,
+          children: [{ type: "text", value: "Key *Decisions*" }],
+        },
+        {
+          type: "list",
+          children: [
+            {
+              type: "listItem",
+              children: [
+                {
+                  type: "paragraph",
+                  children: [
+                    { type: "strong", children: [{ type: "text", value: "00:12:30" }] },
+                    { type: "text", value: " Them: ship Friday ^t-00-12-30" },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+        {
+          type: "paragraph",
+          children: [{ type: "text", value: "Plain block ^abc" }],
+        },
+        {
+          type: "paragraph",
+          children: [{ type: "text", value: "Not an anchor: a^b" }],
+        },
+      ],
+    };
+    remarkBlockAnchors()(tree as never);
+    type Node = {
+      value?: string;
+      data?: { hProperties?: Record<string, unknown> };
+      children: Node[];
+    };
+    const [heading, list, block, plain] = tree.children as unknown as Node[];
+    expect(heading!.data?.hProperties).toEqual({ "data-heading": "key decisions" });
+    const item = list!.children[0]!;
+    expect(item.data?.hProperties).toEqual({ "data-block-id": "t-00-12-30" });
+    expect(item.children[0]!.children[1]!.value).toBe(" Them: ship Friday");
+    expect(block!.data?.hProperties).toEqual({ "data-block-id": "abc" });
+    expect(block!.children[0]!.value).toBe("Plain block");
+    expect(plain!.data).toBeUndefined();
   });
 });

@@ -5,6 +5,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { Editor, Extension } from "@tiptap/core";
+import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import Image from "@tiptap/extension-image";
 import Link from "@tiptap/extension-link";
 import Placeholder from "@tiptap/extension-placeholder";
@@ -28,15 +29,16 @@ const wikilinkDecorationsKey = new PluginKey<DecorationSet>(
   "wikilink-live-preview",
 );
 
-function wikilinkDecorations(
+export function wikilinkDecorations(
   doc: Parameters<typeof DecorationSet.create>[0],
   selection: { from: number; to: number },
 ): DecorationSet {
   const decorations: Decoration[] = [];
   doc.descendants((node, position) => {
-    if (!node.isText || !node.text) return;
+    if (!node.isTextblock || node.type.spec.code) return;
+    const text = node.textBetween(0, node.content.size, "\n", "\n");
     const pattern = /(?<!!)\[\[([^\]\n]+)\]\]/g;
-    for (const match of node.text.matchAll(pattern)) {
+    for (const match of text.matchAll(pattern)) {
       const source = match[1]!;
       const separator = source.indexOf("|");
       const reference = (separator === -1
@@ -44,7 +46,7 @@ function wikilinkDecorations(
         : source.slice(0, separator)
       ).trim();
       if (!reference) continue;
-      const start = position + match.index!;
+      const start = position + 1 + match.index!;
       const end = start + match[0].length;
       const active =
         selection.from <= end &&
@@ -130,10 +132,46 @@ function editorMarkdown(editor: Editor, frontmatter: string, breaks: string) {
   return frontmatter + breaks + restoreWikilinkEscapes(markdown);
 }
 
+export interface EditorSelection {
+  from: number;
+  to: number;
+}
+
+/**
+ * Where a caret that sat at `position` in `previous` belongs in `next` after
+ * an external change replaced the differing region. Text before the change
+ * keeps its position, text after it shifts by the size difference, and a
+ * caret inside the changed region stays within the region's new extent.
+ */
+export function mapPositionAcrossChange(
+  previous: ProseMirrorNode,
+  next: ProseMirrorNode,
+  position: number,
+): number {
+  const size = next.content.size;
+  const start = previous.content.findDiffStart(next.content);
+  if (start === null) return Math.min(position, size);
+  const end = previous.content.findDiffEnd(next.content);
+  let endA = end?.a ?? previous.content.size;
+  let endB = end?.b ?? size;
+  if (endA < start) {
+    endB += start - endA;
+    endA = start;
+  } else if (endB < start) {
+    endA += start - endB;
+    endB = start;
+  }
+  if (position <= start) return Math.min(position, size);
+  if (position >= endA) return Math.min(position + (endB - endA), size);
+  return Math.min(position, endB, size);
+}
+
 export function LiveMarkdownEditor({
+  bridgeId,
   initialValue,
   active,
   focusRequest,
+  selectionRequest,
   onReady,
   onFirstRender,
   onMarkdownChange,
@@ -141,12 +179,15 @@ export function LiveMarkdownEditor({
   onReferenceHover,
   onReferenceLeave,
 }: {
+  bridgeId: string;
   initialValue: string;
   active: boolean;
   focusRequest: { left: number; top: number; sequence: number } | null;
+  /** Restores a caret from a previous mount of this note, e.g. after a plugin reload. */
+  selectionRequest: (EditorSelection & { sequence: number }) | null;
   onReady(): void;
   onFirstRender(markdown: string): void;
-  onMarkdownChange(markdown: string): void;
+  onMarkdownChange(markdown: string, selection: EditorSelection): void;
   onReferenceOpen(reference: string, element: HTMLElement): void;
   onReferenceHover(
     reference: string,
@@ -170,9 +211,17 @@ export function LiveMarkdownEditor({
   changeRef.current = onMarkdownChange;
   hoverRef.current = onReferenceHover;
 
+  // The editor instance is created once per mount. Parents remount it (via
+  // key) when the file path changes; a save echo or an external refresh only
+  // updates the content in place so the caret and undo history survive.
+  const documentRef = useRef(parseMarkdownDocument(initialValue));
+  const lastMarkdownRef = useRef(initialValue);
+
   useEffect(() => {
     if (!rootRef.current) return;
     const document = parseMarkdownDocument(initialValue);
+    documentRef.current = document;
+    lastMarkdownRef.current = initialValue;
     const editor = new Editor({
       element: rootRef.current,
       extensions: [
@@ -199,15 +248,69 @@ export function LiveMarkdownEditor({
     });
     editorRef.current = editor;
     const getMarkdown = () =>
-      editorMarkdown(editor, document.frontmatter, document.bodyLeadingBreaks);
+      editorMarkdown(
+        editor,
+        documentRef.current.frontmatter,
+        documentRef.current.bodyLeadingBreaks,
+      );
     firstRef.current(getMarkdown());
     readyRef.current();
-    editor.on("update", () => changeRef.current(getMarkdown()));
+    editor.on("update", () => {
+      const markdown = getMarkdown();
+      lastMarkdownRef.current = markdown;
+      const { from, to } = editor.state.selection;
+      changeRef.current(markdown, { from, to });
+    });
     return () => {
       editorRef.current = null;
       editor.destroy();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || editor.isDestroyed) return;
+    // Our own save echoes back the markdown this editor last emitted; ignore it.
+    if (initialValue === lastMarkdownRef.current) return;
+    const document = parseMarkdownDocument(initialValue);
+    documentRef.current = document;
+    lastMarkdownRef.current = initialValue;
+    const previous = editor.state.doc;
+    const { from, to } = editor.state.selection;
+    const focused = editor.isFocused;
+    editor.commands.setContent(document.body, false);
+    if (focused) {
+      const next = editor.state.doc;
+      editor.commands.setTextSelection({
+        from: mapPositionAcrossChange(previous, next, from),
+        to: mapPositionAcrossChange(previous, next, to),
+      });
+    }
+    readyRef.current();
   }, [initialValue]);
+
+  useEffect(() => {
+    if (!active || !selectionRequest || !editorRef.current) return;
+    const timer = window.setTimeout(() => {
+      const editor = editorRef.current;
+      if (!editor || editor.isDestroyed) return;
+      const size = editor.state.doc.content.size;
+      try {
+        editor
+          .chain()
+          .focus()
+          .setTextSelection({
+            from: Math.min(selectionRequest.from, size),
+            to: Math.min(selectionRequest.to, size),
+          })
+          .run();
+      } catch {
+        editor.commands.focus("end");
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [active, selectionRequest]);
 
   useEffect(() => {
     if (!active || !focusRequest || !editorRef.current) return;
@@ -286,6 +389,8 @@ export function LiveMarkdownEditor({
   return (
     <div
       className="wikilinks-live-editor"
+      data-wikilinks-autocomplete-host=""
+      data-wikilinks-bridge-id={bridgeId}
       onClick={openReference}
       onPointerOver={hoverReference}
       onPointerOut={leaveReference}

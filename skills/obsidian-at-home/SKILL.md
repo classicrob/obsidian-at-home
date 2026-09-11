@@ -1,6 +1,6 @@
 ---
 name: obsidian-at-home
-description: Use Obsidian at Home (the BB wikilinks plugin) for linked Markdown notes, recursive hover previews, contextual backlinks, note autocomplete, and Thinking Trails. Use when the user asks how to use these features in BB or wants to reconstruct a path they explored through notes. For vault-wide full-text or structural queries, prefer the separate Vault Graph tools when available.
+description: Use Obsidian at Home (the BB wikilinks plugin) for linked Markdown notes, recursive hover previews, contextual backlinks, note autocomplete, and Thinking Trails. Use when the user asks how to use these features in BB, wants to reconstruct a path they explored through notes, or needs to write wikilinks that render correctly in Markdown tables. For vault-wide full-text or structural queries, prefer the separate Vault Graph tools when available.
 ---
 
 # Obsidian at Home
@@ -10,11 +10,18 @@ This BB plugin supplies a Markdown editor, link previews, and navigation history
 ## Help the user navigate
 
 - Open a note inside a BB thread whose workspace contains the notes. If another Markdown opener is pinned, select **Obsidian at Home** under **Settings → File openers**.
-- Click document text to edit it. Changes autosave to the original file. If external edits conflict, use the presented **Reload** or **Overwrite** choice according to the user's intended version.
-- In an existing thread's composer, type `[[` and part of a note name. Arrow keys select; Enter or Tab inserts; Escape dismisses.
+- Click document text to edit it. Changes autosave to the original file. External edits to different lines merge automatically; unsaved drafts and the caret can recover across editor remounts. If external edits conflict, use the presented **Reload** or **Overwrite** choice according to the user's intended version.
+- In an existing thread's composer or the live note editor, type `[[` and part of a note name. Arrow keys select; Enter or clicking a suggestion inserts and opens the note; Tab inserts only; Escape dismisses. Hover a suggestion for a preview. In the composer, Command-hover a completed wikilink to preview it and Command-click to open it.
 - Hover a note link for its excerpt. Links inside previews open further previews. Command-hover shows contextual backlinks. The **Open note** action opens the full file.
 - Website links show scrollable excerpts; `.tldraw` links show embedded static thumbnails. Interactive canvas editing requires a separate canvas opener.
-- `[[Note#Heading]]` currently opens the file without scrolling to the heading.
+- Hover previews scroll to and highlight `[[Note#Heading]]` and `[[Note#^block-id]]` targets. Opening the full file still does not scroll to the target.
+- Explicitly opening a missing Markdown note creates it and its parent folders. Hovering does not create files.
+
+## Write wikilinks
+
+Use `[[Note title]]` or `[[Note title|Display text]]`. Put heading and block targets before the alias, as in `[[Note#Heading|Section]]`.
+
+Inside Markdown table cells, escape the alias separator with exactly one backslash: `[[Note title\|Display text]]`. Otherwise the table parser treats it as a column boundary. This applies in both chat and notes. Outside tables, use the ordinary unescaped separator. Do not escape the pipes that delimit table columns.
 
 ## Reconstruct prior exploration
 

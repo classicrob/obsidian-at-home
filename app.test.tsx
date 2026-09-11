@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, waitFor } from "@testing-library/react";
+import { act, fireEvent, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import {
   loadPluginApp,
@@ -36,6 +36,37 @@ function memoryStorage(): Storage {
 }
 
 describe("Wikilinks preview", () => {
+  it("finishes opening a different note even when focus refresh runs during the read", async () => {
+    const app = await loadPluginApp(() => import("./app.js"));
+    const Opener = app.fileOpeners[0]!.component;
+    const source = { kind: "workspace" as const, threadId: "switch-thread", environmentId: "switch-env", projectId: null };
+    let finish!: (value: { content: string; sha256: string }) => void;
+    const refresh = vi.fn((input) => ({ changed: false, sha256: input.knownSha256 }));
+    const props = { path: "Switch-first.md", source, Original: () => <div>Original preview</div> };
+    const slot = renderSlot(app.fileOpeners[0]!, props, { rpc: {
+      open_markdown: (input) => (input as { path: string }).path === props.path
+        ? { content: "# First switch note", sha256: "first-sha" }
+        : new Promise<{ content: string; sha256: string }>((resolve) => { finish = resolve; }),
+      refresh_markdown: refresh,
+      resolve_markdown_links: () => ({ links: [] }),
+    } });
+    try {
+      await slot.findByText("First switch note");
+      slot.lifecycle.rerender(<Opener {...props} path="Switch-second.md" />);
+      await slot.findByText("Loading Markdown…");
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      await act(async () => finish({ content: "# Second switch note", sha256: "second-sha" }));
+      await slot.findByText("Second switch note");
+      expect(refresh).not.toHaveBeenCalled();
+    } finally {
+      slot.lifecycle.unmount();
+    }
+  });
+
+
   it("registers for Markdown and opens an aliased wikilink through BB navigation", async () => {
     const app = await loadPluginApp(() => import("./app.js"));
     const opener = app.fileOpeners[0]!;
@@ -59,9 +90,10 @@ describe("Wikilinks preview", () => {
       },
       {
         rpc: {
+          refresh_markdown: (input) => ({ changed: false, sha256: (input as { knownSha256: string }).knownSha256 }),
           open_markdown: () => ({
             content:
-              "Read [[Strategy|the strategy]] and [Example document.md](/workspace/Example%20document.md).",
+              "Read [[Strategy|the strategy]] and [Continual learning.md](/workspace/Continual%20learning.md).",
             sha256: "current-sha",
           }),
           resolve_markdown_links: () => ({
@@ -76,11 +108,11 @@ describe("Wikilinks preview", () => {
                 exists: true,
               },
               {
-                reference: "/workspace/Example document.md",
+                reference: "/workspace/Continual learning.md",
                 target: {
                   kind: "workspace" as const,
                   environmentId: "env-1",
-                  path: "Example document.md",
+                  path: "Continual learning.md",
                 },
                 exists: true,
               },
@@ -88,7 +120,7 @@ describe("Wikilinks preview", () => {
           }),
           preview_file: (input) =>
             (input as { target: { path: string } }).target.path ===
-            "Example document.md"
+            "Continual learning.md"
               ? {
                   content:
                     "# Preview heading\n\nRendered **Markdown** with [Details.md](notes/Details.md).",
@@ -132,7 +164,7 @@ describe("Wikilinks preview", () => {
       },
     });
     const markdownLink = await slot.findByRole("link", {
-      name: "Example document.md",
+      name: "Continual learning.md",
     });
     fireEvent.click(markdownLink);
     expect(slot.inspection.navigateCalls).toContainEqual({
@@ -141,7 +173,7 @@ describe("Wikilinks preview", () => {
         target: {
           kind: "workspace",
           environmentId: "env-1",
-          path: "Example document.md",
+          path: "Continual learning.md",
         },
         location: null,
       },
@@ -222,6 +254,294 @@ describe("Wikilinks preview", () => {
     slot.lifecycle.unmount();
   }, 15_000);
 
+  it("keeps one refresh in flight across repeated focus events", async () => {
+    const app = await loadPluginApp(() => import("./app.js"));
+    let finish!: (value: { changed: true; content: string; sha256: string }) => void;
+    const refresh = vi.fn(() => new Promise<{ changed: true; content: string; sha256: string }>((resolve) => { finish = resolve; }));
+    const slot = renderSlot(app.fileOpeners[0]!, {
+      path: "Focus-refresh.md",
+      source: { kind: "host", threadId: null, environmentId: null, projectId: null },
+      Original: () => <div>Original</div>,
+    }, { rpc: {
+      open_markdown: () => ({ content: "# Focus baseline", sha256: "old" }),
+      refresh_markdown: refresh,
+      resolve_markdown_links: () => ({ links: [] }),
+    } });
+    try {
+      await slot.findByRole("heading", { name: "Focus baseline" });
+      await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+      fireEvent.focus(window);
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+      fireEvent.focus(window);
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+      expect(refresh).toHaveBeenCalledTimes(1);
+      await act(async () => { finish({ changed: true, content: "# Focus updated", sha256: "new" }); });
+      fireEvent.click(await slot.findByRole("heading", { name: "Focus updated" }));
+      const editor = await slot.findByRole("textbox");
+      await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+      await act(async () => { finish({ changed: true, content: "# Clean editor updated", sha256: "newer" }); });
+      await waitFor(() => expect(editor.textContent).toContain("Clean editor updated"));
+      expect(slot.inspection.rpcCalls.some((call) => call.method === "save_markdown")).toBe(false);
+    } finally { slot.lifecycle.unmount(); }
+  });
+
+  it("shows refresh failure and recovers without changing tabs, including unchanged reads", async () => {
+    const app = await loadPluginApp(() => import("./app.js"));
+    let failed = true;
+    let changed = false;
+    const slot = renderSlot(app.fileOpeners[0]!, {
+      path: "Retry-refresh.md",
+      source: { kind: "host", threadId: null, environmentId: null, projectId: null },
+      Original: () => <div>Original</div>,
+    }, { rpc: {
+      open_markdown: () => ({ content: "# Retry baseline", sha256: "old" }),
+      refresh_markdown: () => {
+        if (failed) throw new Error("HTTP 504: Timed out waiting for command result");
+        return changed ? { changed: true, content: "# Retry updated", sha256: "new" }
+          : { changed: false, sha256: "old" };
+      },
+      resolve_markdown_links: () => ({ links: [] }),
+    } });
+    try {
+      await slot.findByRole("heading", { name: "Retry baseline" });
+      await slot.findByText("Live updates interrupted. Retrying…");
+      failed = false;
+      await waitFor(() => expect(slot.queryByText("Live updates interrupted. Retrying…")).toBeNull());
+      changed = true;
+      await slot.findByRole("heading", { name: "Retry updated" });
+    } finally { slot.lifecycle.unmount(); }
+  });
+
+  it("protects unsaved editor text when an external refresh arrives during editing", async () => {
+    const app = await loadPluginApp(() => import("./app.js"));
+    let finish!: (value: { changed: true; content: string; sha256: string }) => void;
+    const refresh = vi.fn(() => new Promise<{ changed: true; content: string; sha256: string }>((resolve) => { finish = resolve; }));
+    const save = vi.fn(() => ({ outcome: "conflict", currentSha256: "external" }));
+    const slot = renderSlot(app.fileOpeners[0]!, {
+      path: "Dirty-refresh.md",
+      source: { kind: "host", threadId: null, environmentId: null, projectId: null },
+      Original: () => <div>Original</div>,
+    }, { rpc: {
+      open_markdown: () => ({ content: "# Dirty baseline", sha256: "old" }),
+      refresh_markdown: refresh,
+      resolve_markdown_links: () => ({ links: [] }),
+      save_markdown: save,
+    } });
+    try {
+      fireEvent.click(await slot.findByRole("heading", { name: "Dirty baseline" }));
+      const editor = await slot.findByRole("textbox");
+      await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+      editor.blur();
+      const heading = editor.querySelector("h1")!;
+      heading.textContent = "My unsaved text";
+      fireEvent.input(heading);
+      await waitFor(() => expect(slot.queryByText("Unsaved changes")).not.toBeNull());
+      await act(async () => { finish({ changed: true, content: "# External text", sha256: "external" }); });
+      await slot.findByText("This note changed on disk.");
+      expect(editor.textContent).toContain("My unsaved text");
+      expect(editor.textContent).not.toContain("External text");
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 800)); });
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(save).not.toHaveBeenCalled();
+    } finally { slot.lifecycle.unmount(); }
+  }, 15_000);
+
+  it("merges an external change into unsaved edits instead of blocking on the banner", async () => {
+    const app = await loadPluginApp(() => import("./app.js"));
+    const base = "# Merge baseline\n\nFirst paragraph.\n\nSecond paragraph.\n";
+    const external = `${base}\nAppended by an agent.\n`;
+    let finish!: (value: { changed: true; content: string; sha256: string }) => void;
+    const refresh = vi.fn(() => new Promise<{ changed: true; content: string; sha256: string }>((resolve) => { finish = resolve; }));
+    const saves: Array<Record<string, unknown>> = [];
+    const slot = renderSlot(app.fileOpeners[0]!, {
+      path: "Merge-refresh.md",
+      source: { kind: "host", threadId: null, environmentId: null, projectId: null },
+      Original: () => <div>Original</div>,
+    }, { rpc: {
+      open_markdown: () => ({ content: base, sha256: "old" }),
+      refresh_markdown: refresh,
+      resolve_markdown_links: () => ({ links: [] }),
+      save_markdown: (input) => {
+        saves.push(input as unknown as Record<string, unknown>);
+        return { outcome: "written" as const, sha256: "merged-sha" };
+      },
+    } });
+    try {
+      fireEvent.click(await slot.findByRole("heading", { name: "Merge baseline" }));
+      const editor = await slot.findByRole("textbox");
+      await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+      editor.blur();
+      const heading = editor.querySelector("h1")!;
+      heading.textContent = "Merge mine";
+      fireEvent.input(heading);
+      await waitFor(() => expect(slot.queryByText("Unsaved changes")).not.toBeNull());
+      await act(async () => { finish({ changed: true, content: external, sha256: "external" }); });
+      await waitFor(() => expect(editor.textContent).toContain("Appended by an agent."));
+      expect(editor.textContent).toContain("Merge mine");
+      expect(slot.queryByText("This note changed on disk.")).toBeNull();
+      await waitFor(() => expect(saves).toHaveLength(1), { timeout: 2500 });
+      expect(saves[0]).toMatchObject({
+        content: "# Merge mine\n\nFirst paragraph.\n\nSecond paragraph.\n\nAppended by an agent.\n",
+        expectedSha256: "external",
+      });
+      expect(await slot.findByText("Saved")).not.toBeNull();
+    } finally { slot.lifecycle.unmount(); }
+  }, 15_000);
+
+  it("merges the file's newer copy when a save hits a conflict", async () => {
+    const app = await loadPluginApp(() => import("./app.js"));
+    const base = "# Conflict baseline\n\nBody.\n";
+    const external = `${base}\nAgent line.\n`;
+    let fileSha = "old";
+    const saves: Array<Record<string, unknown>> = [];
+    const slot = renderSlot(app.fileOpeners[0]!, {
+      path: "Save-conflict.md",
+      source: { kind: "host", threadId: null, environmentId: null, projectId: null },
+      Original: () => <div>Original</div>,
+    }, { rpc: {
+      open_markdown: () => ({ content: base, sha256: "old" }),
+      refresh_markdown: (input) => {
+        const known = (input as { knownSha256: string }).knownSha256;
+        // Polls do not notice the agent's write until our save has collided with it.
+        if (saves.length === 0 || known === fileSha) {
+          return { changed: false as const, sha256: known };
+        }
+        return { changed: true as const, content: external, sha256: fileSha };
+      },
+      resolve_markdown_links: () => ({ links: [] }),
+      save_markdown: (input) => {
+        const request = input as { content: string; expectedSha256?: string };
+        saves.push(request as unknown as Record<string, unknown>);
+        if (request.expectedSha256 !== fileSha) {
+          return { outcome: "conflict" as const, currentSha256: fileSha };
+        }
+        fileSha = "written";
+        return { outcome: "written" as const, sha256: fileSha };
+      },
+    } });
+    try {
+      fireEvent.click(await slot.findByRole("heading", { name: "Conflict baseline" }));
+      const editor = await slot.findByRole("textbox");
+      // The agent writes between the last poll and our save.
+      fileSha = "external";
+      editor.blur();
+      const heading = editor.querySelector("h1")!;
+      heading.textContent = "Conflict mine";
+      fireEvent.input(heading);
+      await waitFor(() => expect(saves.length).toBeGreaterThanOrEqual(2), { timeout: 4000 });
+      expect(saves[0]).toMatchObject({ expectedSha256: "old" });
+      expect(saves[1]).toMatchObject({
+        content: "# Conflict mine\n\nBody.\n\nAgent line.\n",
+        expectedSha256: "external",
+      });
+      await waitFor(() => expect(editor.textContent).toContain("Agent line."));
+      expect(editor.textContent).toContain("Conflict mine");
+      expect(slot.queryByText("This note changed on disk.")).toBeNull();
+      expect(await slot.findByText("Saved")).not.toBeNull();
+    } finally { slot.lifecycle.unmount(); }
+  }, 15_000);
+
+  it("restores unsaved text, editing mode and the caret from a draft after a remount", async () => {
+    const storage = memoryStorage();
+    vi.stubGlobal("sessionStorage", storage);
+    try {
+      const app = await loadPluginApp(() => import("./app.js"));
+      const source = { kind: "host" as const, threadId: null, environmentId: null, projectId: null };
+      const base = "# Draft baseline\n\nBody.\n";
+      const draftMarkdown = "# Draft restored\n\nBody.";
+      storage.setItem(
+        `wikilinks:editor-draft:${JSON.stringify(["Draft-restore.md", source])}`,
+        JSON.stringify({ baseSha: "old", base, markdown: draftMarkdown, editing: true, selection: { from: 5, to: 5 }, at: Date.now() }),
+      );
+      const saves: Array<Record<string, unknown>> = [];
+      const slot = renderSlot(app.fileOpeners[0]!, {
+        path: "Draft-restore.md",
+        source,
+        Original: () => <div>Original</div>,
+      }, { rpc: {
+        open_markdown: () => ({ content: base, sha256: "old" }),
+        refresh_markdown: (input) => ({ changed: false, sha256: (input as { knownSha256: string }).knownSha256 }),
+        resolve_markdown_links: () => ({ links: [] }),
+        save_markdown: (input) => {
+          saves.push(input as unknown as Record<string, unknown>);
+          return { outcome: "written" as const, sha256: "draft-saved" };
+        },
+      } });
+      try {
+        const editor = await slot.findByRole("textbox");
+        await waitFor(() => expect(editor.textContent).toContain("Draft restored"));
+        expect(await slot.findByText("Editing")).not.toBeNull();
+        await waitFor(() => expect(saves).toHaveLength(1), { timeout: 2500 });
+        expect(saves[0]).toMatchObject({ content: draftMarkdown, expectedSha256: "old" });
+        await waitFor(() => expect(storage.length).toBe(0));
+        expect(await slot.findByText("Saved")).not.toBeNull();
+      } finally { slot.lifecycle.unmount(); }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }, 15_000);
+
+  it("parks unsaved text as a draft while editing and merges it when the file moved on before the remount", async () => {
+    const storage = memoryStorage();
+    vi.stubGlobal("sessionStorage", storage);
+    try {
+      const app = await loadPluginApp(() => import("./app.js"));
+      const source = { kind: "host" as const, threadId: null, environmentId: null, projectId: null };
+      const key = `wikilinks:editor-draft:${JSON.stringify(["Draft-park.md", source])}`;
+      const base = "# Park baseline\n\nBody.\n";
+      const slot = renderSlot(app.fileOpeners[0]!, {
+        path: "Draft-park.md",
+        source,
+        Original: () => <div>Original</div>,
+      }, { rpc: {
+        open_markdown: () => ({ content: base, sha256: "old" }),
+        refresh_markdown: (input) => ({ changed: false, sha256: (input as { knownSha256: string }).knownSha256 }),
+        resolve_markdown_links: () => ({ links: [] }),
+        save_markdown: () => new Promise<never>(() => {}),
+      } });
+      try {
+        fireEvent.click(await slot.findByRole("heading", { name: "Park baseline" }));
+        const editor = await slot.findByRole("textbox");
+        editor.blur();
+        const heading = editor.querySelector("h1")!;
+        heading.textContent = "Park mine";
+        fireEvent.input(heading);
+        await waitFor(() => expect(storage.getItem(key)).not.toBeNull());
+        const draft = JSON.parse(storage.getItem(key)!) as { markdown: string; base: string; baseSha: string };
+        expect(draft).toMatchObject({ base, baseSha: "old", markdown: "# Park mine\n\nBody." });
+      } finally { slot.lifecycle.unmount(); }
+
+      // The bundle reloads and an agent appended to the file meanwhile.
+      const saves: Array<Record<string, unknown>> = [];
+      const remounted = renderSlot(app.fileOpeners[0]!, {
+        path: "Draft-park.md",
+        source,
+        Original: () => <div>Original</div>,
+      }, { rpc: {
+        open_markdown: () => ({ content: `${base}\nAgent line.\n`, sha256: "external" }),
+        refresh_markdown: (input) => ({ changed: false, sha256: (input as { knownSha256: string }).knownSha256 }),
+        resolve_markdown_links: () => ({ links: [] }),
+        save_markdown: (input) => {
+          saves.push(input as unknown as Record<string, unknown>);
+          return { outcome: "written" as const, sha256: "merged" };
+        },
+      } });
+      try {
+        const editor = await remounted.findByRole("textbox");
+        await waitFor(() => expect(editor.textContent).toContain("Park mine"));
+        expect(editor.textContent).toContain("Agent line.");
+        await waitFor(() => expect(saves).toHaveLength(1), { timeout: 2500 });
+        expect(saves[0]).toMatchObject({
+          content: "# Park mine\n\nBody.\n\nAgent line.\n",
+          expectedSha256: "external",
+        });
+        await waitFor(() => expect(storage.getItem(key)).toBeNull());
+      } finally { remounted.lifecycle.unmount(); }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }, 15_000);
+
   it("autosaves rich-preview edits back to the live Markdown file", async () => {
     const saves: Array<Record<string, unknown>> = [];
     const app = await loadPluginApp(() => import("./app.js"));
@@ -240,6 +560,7 @@ describe("Wikilinks preview", () => {
       },
       {
         rpc: {
+          refresh_markdown: (input) => ({ changed: false, sha256: (input as { knownSha256: string }).knownSha256 }),
           open_markdown: () => ({
             content:
               "---\ntitle: Editable\n---\n\n# Original heading\n\nSee [[Strategy|the plan]].\n",
@@ -294,20 +615,21 @@ describe("Wikilinks preview", () => {
       },
       {
         rpc: {
+          refresh_markdown: (input) => ({ changed: false, sha256: (input as { knownSha256: string }).knownSha256 }),
           open_markdown: () => ({
             content:
-              "See [the pitch canvas](examples/Team%20workshops%20(whiteboard).tldraw).",
+              "See [the pitch canvas](websim/I-%20Prompt%20arenas%20into%20existence%20(whiteboard).tldraw).",
             sha256: "canvas-note-sha",
           }),
           resolve_markdown_links: () => ({
             links: [
               {
                 reference:
-                  "examples/Team workshops (whiteboard).tldraw",
+                  "websim/I- Prompt arenas into existence (whiteboard).tldraw",
                 target: {
                   kind: "workspace" as const,
                   environmentId: "env-canvas",
-                  path: "examples/Team workshops (whiteboard).tldraw",
+                  path: "websim/I- Prompt arenas into existence (whiteboard).tldraw",
                 },
                 exists: true,
               },
@@ -329,7 +651,7 @@ describe("Wikilinks preview", () => {
     await waitFor(() => {
       expect(
         document.body.querySelector<HTMLImageElement>(
-          'img[alt="Canvas preview of Team workshops (whiteboard)"]',
+          'img[alt="Canvas preview of I- Prompt arenas into existence (whiteboard)"]',
         )?.src,
       ).toBe("data:image/png;base64,iVBORw0KGgo=");
     });
@@ -354,6 +676,7 @@ describe("Wikilinks preview", () => {
       },
       {
         rpc: {
+          refresh_markdown: (input) => ({ changed: false, sha256: (input as { knownSha256: string }).knownSha256 }),
           open_markdown: () => ({
             content: "See [[Target]].",
             sha256: "backlink-note-sha",
@@ -498,8 +821,8 @@ describe("Wikilinks preview", () => {
       <div data-thread-window data-wikilinks-bridge-id="bridge-1">
         <div data-markdown-preview>
           <p>Read [[folder/Note|the note]] and ![[Diagram]].</p>
-          <p><a class="existing-link" title="Original title" href="/Users/me/Notes/Example%20document.md">Example document.md</a></p>
-          <p><a href="examples/Team%20workshops%20(whiteboard).tldraw">the workshop whiteboard</a></p>
+          <p><a class="existing-link" title="Original title" href="/Users/me/Notes/Continual%20learning.md">Continual learning.md</a></p>
+          <p><a href="websim/I-%20Prompt%20arenas%20into%20existence%20(whiteboard).tldraw">the arenas whiteboard</a></p>
           <p><a class="web-link" href="https://example.com/essay">Example essay</a></p>
           <pre><code>[[Code sample]]</code></pre>
         </div>
@@ -527,18 +850,18 @@ describe("Wikilinks preview", () => {
     expect(document.body.textContent).toContain("![[Diagram]]");
     expect(document.body.textContent).toContain("[[Code sample]]");
     const markdownLink = document.body.querySelector<HTMLAnchorElement>(
-      'a[href="/Users/me/Notes/Example%20document.md"]',
+      'a[href="/Users/me/Notes/Continual%20learning.md"]',
     );
     expect(markdownLink?.classList.contains("wikilink-chat")).toBe(true);
     expect(markdownLink?.dataset.wikilinkReference).toBe(
-      "/Users/me/Notes/Example document.md",
+      "/Users/me/Notes/Continual learning.md",
     );
     const tldrawLink = document.body.querySelector<HTMLAnchorElement>(
-      'a[href="examples/Team%20workshops%20(whiteboard).tldraw"]',
+      'a[href="websim/I-%20Prompt%20arenas%20into%20existence%20(whiteboard).tldraw"]',
     );
     expect(tldrawLink?.classList.contains("wikilink-chat")).toBe(true);
     expect(tldrawLink?.dataset.wikilinkReference).toBe(
-      "examples/Team workshops (whiteboard).tldraw",
+      "websim/I- Prompt arenas into existence (whiteboard).tldraw",
     );
     const webLink = document.body.querySelector<HTMLAnchorElement>(
       'a[href="https://example.com/essay"]',
@@ -573,18 +896,18 @@ describe("Wikilinks preview", () => {
     fireEvent.click(markdownLink!);
     expect(opened.at(-1)).toEqual({
       bridgeId: "bridge-1",
-      reference: "/Users/me/Notes/Example document.md",
+      reference: "/Users/me/Notes/Continual learning.md",
     });
     fireEvent.pointerOver(markdownLink!);
     expect(hovered.at(-1)).toEqual({
       bridgeId: "bridge-1",
-      reference: "/Users/me/Notes/Example document.md",
+      reference: "/Users/me/Notes/Continual learning.md",
       anchor: { top: 0, right: 0, bottom: 0, left: 0 },
     });
     fireEvent.pointerOver(tldrawLink!);
     expect(hovered.at(-1)).toEqual({
       bridgeId: "bridge-1",
-      reference: "examples/Team workshops (whiteboard).tldraw",
+      reference: "websim/I- Prompt arenas into existence (whiteboard).tldraw",
       anchor: { top: 0, right: 0, bottom: 0, left: 0 },
     });
     fireEvent.pointerOver(webLink!);
@@ -600,7 +923,7 @@ describe("Wikilinks preview", () => {
     expect(document.body.textContent).toContain("[[folder/Note|the note]]");
     expect(markdownLink?.isConnected).toBe(true);
     expect(markdownLink?.getAttribute("href")).toBe(
-      "/Users/me/Notes/Example%20document.md",
+      "/Users/me/Notes/Continual%20learning.md",
     );
     expect(markdownLink?.getAttribute("class")).toBe("existing-link");
     expect(markdownLink?.getAttribute("title")).toBe("Original title");
@@ -840,12 +1163,12 @@ describe("Wikilinks preview", () => {
       {
         rpc: {
           autocomplete_wikilinks: (input) =>
-            (input as { query: string }).query === "workshop team"
+            (input as { query: string }).query === "arena prompt"
               ? [
                   {
-                    reference: "examples/Team workshops",
-                    label: "Team workshops",
-                    directory: "examples/",
+                    reference: "websim/Prompt arenas",
+                    label: "Prompt arenas",
+                    directory: "websim/",
                   },
                 ]
               : [],
@@ -864,7 +1187,7 @@ describe("Wikilinks preview", () => {
     fireEvent(
       window,
       new CustomEvent(COMPOSER_WIKILINK_QUERY_EVENT, {
-        detail: { bridgeId, requestId: 42, query: "workshop team" },
+        detail: { bridgeId, requestId: 42, query: "arena prompt" },
       }),
     );
     await waitFor(() => {
@@ -873,9 +1196,9 @@ describe("Wikilinks preview", () => {
         requestId: 42,
         suggestions: [
           {
-            reference: "examples/Team workshops",
-            label: "Team workshops",
-            directory: "examples/",
+            reference: "websim/Prompt arenas",
+            label: "Prompt arenas",
+            directory: "websim/",
           },
         ],
       });
@@ -902,8 +1225,8 @@ describe("Wikilinks preview", () => {
           ok: true,
           result: {
             inVault: true,
-            path: "Project planning.md",
-            title: "Project planning",
+            path: "Structured entropy.md",
+            title: "Structured entropy",
             entityId: 7,
           },
         });
@@ -912,25 +1235,25 @@ describe("Wikilinks preview", () => {
         return json(200, {
           ok: true,
           result: {
-            title: "Project planning",
-            path: "Project planning.md",
+            title: "Structured entropy",
+            path: "Structured entropy.md",
             kind: "note",
             entityId: 7,
             backlinks: [
               {
                 sourceKind: "note",
-                sourceTitle: "Team handbook",
-                sourcePath: "Team handbook.md",
+                sourceTitle: "Agent society",
+                sourcePath: "Agent society.md",
                 threadId: null,
-                heading: "Team handbook",
+                heading: "Agent society",
                 context:
-                  "The team uses [[Project planning|planning checklist]] and [[Weekly review|review notes]].",
+                  "The agents need [[Structured entropy|structured sources of difference]] and [[Inter-run learning|shared memory]].",
                 line: 20,
                 linkKind: "wikilink",
                 target: {
                   kind: "host",
                   hostId: "host_1",
-                  path: "/vault/Team handbook.md",
+                  path: "/vault/Agent society.md",
                 },
               },
               {
@@ -938,8 +1261,8 @@ describe("Wikilinks preview", () => {
                 sourceTitle: "Ideas board",
                 sourcePath: "Ideas board.tldraw",
                 threadId: null,
-                heading: "Ideas board > Planning sticky",
-                context: "[[Project planning]] guides the meeting",
+                heading: "Ideas board > Mutation sticky",
+                context: "[[Structured entropy]] seeds variation",
                 line: null,
                 linkKind: "wikilink",
                 target: {
@@ -950,7 +1273,7 @@ describe("Wikilinks preview", () => {
               },
               {
                 sourceKind: "thread",
-                sourceTitle: "team discussion",
+                sourceTitle: "agent societies",
                 sourcePath: null,
                 threadId: "thr_1",
                 heading: null,
@@ -962,13 +1285,13 @@ describe("Wikilinks preview", () => {
             ],
             unlinked: [
               {
-                sourceTitle: "Meeting notes",
-                sourcePath: "Meeting notes.md",
-                snippet: "project planning shows up without a link",
+                sourceTitle: "Novelty search",
+                sourcePath: "Novelty search.md",
+                snippet: "structured entropy shows up without a link",
                 target: {
                   kind: "host",
                   hostId: "host_1",
-                  path: "/vault/Meeting notes.md",
+                  path: "/vault/Novelty search.md",
                 },
               },
             ],
@@ -986,7 +1309,7 @@ describe("Wikilinks preview", () => {
       const slot = renderSlot(
         opener,
         {
-          path: "Project planning.md",
+          path: "Structured entropy.md",
           source: {
             kind: "workspace",
             threadId: "thread-graph",
@@ -997,8 +1320,9 @@ describe("Wikilinks preview", () => {
         },
         {
           rpc: {
+          refresh_markdown: (input) => ({ changed: false, sha256: (input as { knownSha256: string }).knownSha256 }),
             open_markdown: () => ({
-              content: "# Project planning\n\nBody.",
+              content: "# Structured entropy\n\nBody.",
               sha256: "graph-sha",
             }),
             resolve_markdown_links: () => ({ links: [] }),
@@ -1017,16 +1341,16 @@ describe("Wikilinks preview", () => {
         url: "/api/v1/plugins/vault-graph/rpc/resolve_target",
         body: {
           kind: "workspace",
-          path: "Project planning.md",
+          path: "Structured entropy.md",
           environmentId: "env-graph",
         },
       });
-      expect(fetchBodies[1]?.body).toEqual({ path: "Project planning.md" });
+      expect(fetchBodies[1]?.body).toEqual({ path: "Structured entropy.md" });
       expect(section.textContent).toContain("Linked mentions");
-      expect(section.textContent).toContain("Team handbook");
+      expect(section.textContent).toContain("Agent society");
       expect(section.textContent).toContain("Ideas board");
-      expect(section.textContent).toContain("Ideas board › Planning sticky");
-      expect(section.textContent).toContain("team discussion");
+      expect(section.textContent).toContain("Ideas board › Mutation sticky");
+      expect(section.textContent).toContain("agent societies");
       expect(
         section.querySelector(".wikilinks-document-backlinks-count")?.textContent,
       ).toBe("3");
@@ -1035,12 +1359,12 @@ describe("Wikilinks preview", () => {
       );
       // Aliased links show their alias, plain links their title (Obsidian style);
       // the raw wikilink is kept in the title attribute.
-      expect(marks).toEqual(["planning checklist", "Project planning"]);
+      expect(marks).toEqual(["structured sources of difference", "Structured entropy"]);
       expect(
         Array.from(section.querySelectorAll("mark")).map((mark) => mark.getAttribute("title")),
       ).toEqual([
-        "[[Project planning|planning checklist]]",
-        "[[Project planning]]",
+        "[[Structured entropy|structured sources of difference]]",
+        "[[Structured entropy]]",
       ]);
       // The section is sourced from vault-graph, so the wikilinks fallback stays idle.
       expect(
@@ -1051,29 +1375,29 @@ describe("Wikilinks preview", () => {
         ),
       ).toBe(false);
 
-      fireEvent.click(slot.getByRole("link", { name: "Team handbook" }));
+      fireEvent.click(slot.getByRole("link", { name: "Agent society" }));
       expect(slot.inspection.navigateCalls).toContainEqual({
         method: "experimental_openFilePreview",
         options: {
-          target: { kind: "host", hostId: "host_1", path: "/vault/Team handbook.md" },
+          target: { kind: "host", hostId: "host_1", path: "/vault/Agent society.md" },
           location: null,
         },
       });
-      fireEvent.click(slot.getByRole("button", { name: "team discussion" }));
+      fireEvent.click(slot.getByRole("button", { name: "agent societies" }));
       expect(slot.inspection.navigateCalls).toContainEqual({
         method: "toThread",
         threadId: "thr_1",
       });
 
-      expect(section.textContent).not.toContain("Meeting notes");
+      expect(section.textContent).not.toContain("Novelty search");
       fireEvent.click(slot.getByRole("button", { name: /Unlinked mentions/ }));
-      expect(section.textContent).toContain("Meeting notes");
+      expect(section.textContent).toContain("Novelty search");
       expect(section.textContent).toContain(
-        "project planning shows up without a link",
+        "structured entropy shows up without a link",
       );
 
       fireEvent.click(slot.getByRole("button", { name: /Linked mentions/ }));
-      expect(section.textContent).not.toContain("Team handbook");
+      expect(section.textContent).not.toContain("Agent society");
       expect(storage.getItem("wikilinks:document-backlinks:collapsed")).toBe("1");
       slot.lifecycle.unmount();
     } finally {
@@ -1108,6 +1432,7 @@ describe("Wikilinks preview", () => {
         },
         {
           rpc: {
+          refresh_markdown: (input) => ({ changed: false, sha256: (input as { knownSha256: string }).knownSha256 }),
             open_markdown: () => ({ content: "# Target", sha256: "target-sha" }),
             resolve_markdown_links: () => ({ links: [] }),
             preview_file: (input) => {
@@ -1181,6 +1506,7 @@ describe("Wikilinks preview", () => {
       {
         settings: { documentBacklinks: false },
         rpc: {
+          refresh_markdown: (input) => ({ changed: false, sha256: (input as { knownSha256: string }).knownSha256 }),
           open_markdown: () => ({ content: "# Quiet", sha256: "quiet-sha" }),
           resolve_markdown_links: () => ({ links: [] }),
         },

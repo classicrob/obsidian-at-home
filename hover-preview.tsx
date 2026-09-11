@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from "react";
+import { useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown, {
   defaultUrlTransform,
@@ -12,8 +12,10 @@ import {
 import {
   decodeLocalMarkdownPath,
   decodeWikilinkUrl,
+  remarkBlockAnchors,
   remarkWikilinks,
   WIKILINK_URL_PREFIX,
+  type WikilinkSubpath,
 } from "./wikilink-markdown.js";
 import type { HoverAnchorRect } from "./hover-types.js";
 
@@ -39,7 +41,44 @@ export interface HoverPreviewData {
   links: HoverPreviewLink[];
 }
 
+export const HOVER_FOCUS_CLASS = "wikilink-hover-focus";
 export const HOVER_OPEN_DELAY_MS = 350;
+
+function cssEscape(value: string): string {
+  return typeof CSS !== "undefined" && typeof CSS.escape === "function"
+    ? CSS.escape(value)
+    : value.replace(/["\\]/g, "\\$&");
+}
+
+/** The rendered element a `#heading` / `#^block` subpath points at. */
+export function findFocusElement(
+  root: ParentNode,
+  focus: WikilinkSubpath,
+): HTMLElement | null {
+  if (focus.kind === "block") {
+    return root.querySelector<HTMLElement>(
+      `[data-block-id="${cssEscape(focus.id)}"]`,
+    );
+  }
+  return root.querySelector<HTMLElement>(
+    `[data-heading="${cssEscape(focus.text)}"]`,
+  );
+}
+
+/** Scrolls `body` so `element` sits near its top and marks it. */
+export function revealFocusElement(body: HTMLElement, element: HTMLElement): void {
+  for (const previous of Array.from(
+    body.querySelectorAll(`.${HOVER_FOCUS_CLASS}`),
+  )) {
+    previous.classList.remove(HOVER_FOCUS_CLASS);
+  }
+  element.classList.add(HOVER_FOCUS_CLASS);
+  const offset =
+    element.getBoundingClientRect().top -
+    body.getBoundingClientRect().top +
+    body.scrollTop;
+  body.scrollTop = Math.max(0, offset - 10);
+}
 export const HOVER_CLOSE_DELAY_MS = 180;
 
 function createHoverMarkdownComponents(
@@ -130,6 +169,7 @@ export function HoverPreviewCard({
   openLabel = "Open file",
   footerLabel = "Excerpt from the note",
   portalContainer,
+  focus = null,
 }: {
   anchor: HoverAnchorRect | null;
   title: string;
@@ -154,7 +194,18 @@ export function HoverPreviewCard({
   openLabel?: string;
   footerLabel?: string;
   portalContainer?: Element | null;
+  /** Subpath of the hovered reference; the body scrolls to it once rendered. */
+  focus?: WikilinkSubpath | null;
 }) {
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const content = preview?.content ?? null;
+  useLayoutEffect(() => {
+    const body = bodyRef.current;
+    if (!body || loading || !focus || content === null) return;
+    const element = findFocusElement(body, focus);
+    if (element) revealFocusElement(body, element);
+    else body.scrollTop = 0;
+  }, [anchor, content, focus, loading]);
   const components = useMemo(
     () =>
       createHoverMarkdownComponents(
@@ -209,6 +260,7 @@ export function HoverPreviewCard({
         ) : null}
       </div>
       <div
+        ref={bodyRef}
         className="wikilink-hover-card-body"
         onScroll={onInteract}
         onPointerDown={onInteract}
@@ -238,7 +290,7 @@ export function HoverPreviewCard({
                   ) : null}
                   <div className="wikilink-backlink-context">
                     <ReactMarkdown
-                      remarkPlugins={[remarkGfm, remarkWikilinks]}
+                      remarkPlugins={[remarkGfm, remarkWikilinks, remarkBlockAnchors]}
                       components={createHoverMarkdownComponents(
                         renderBacklinkNoteLink
                           ? (reference, children) =>
@@ -277,7 +329,9 @@ export function HoverPreviewCard({
         ) : preview?.content ? (
           <ReactMarkdown
             remarkPlugins={
-              contentKind === "web" ? [remarkGfm] : [remarkGfm, remarkWikilinks]
+              contentKind === "web"
+                ? [remarkGfm]
+                : [remarkGfm, remarkWikilinks, remarkBlockAnchors]
             }
             components={components}
             urlTransform={(url) =>

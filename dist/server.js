@@ -12,7 +12,8 @@ var __export = (target, all) => {
 
 // server.ts
 import path3 from "node:path";
-import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 
 // node_modules/zod/v4/classic/external.js
@@ -18946,6 +18947,23 @@ function compareCandidates(a, b) {
   const depthDifference = a.split("/").length - b.split("/").length;
   return depthDifference || a.localeCompare(b);
 }
+function wikilinkFallbackPath(reference, currentPath) {
+  const requestedFile = stripSubpath(normalizeWikilinkReference(reference));
+  if (requestedFile === "") return currentPath.replace(/\\/g, "/");
+  const slashRequested = requestedFile.replace(/\\/g, "/");
+  const directRequest = withLinkableExtension(
+    path.posix.normalize(slashRequested.replace(/^\/+/, "")).replace(/^(?:\.\.\/)+/, "")
+  );
+  const relativeRequest = withLinkableExtension(
+    path.posix.normalize(
+      path.posix.join(
+        path.posix.dirname(currentPath.replace(/\\/g, "/")),
+        slashRequested
+      )
+    )
+  );
+  return !relativeRequest.startsWith("../") && !path.posix.isAbsolute(relativeRequest) ? relativeRequest : directRequest;
+}
 function resolveWikilinkPath(reference, currentPath, availableMarkdownPaths) {
   const normalizedCurrentPath = currentPath.replace(/\\/g, "/");
   const currentDirectory = path.posix.dirname(normalizedCurrentPath);
@@ -19333,6 +19351,14 @@ function normalizedCandidate(value) {
 }
 function compareCandidates2(left, right) {
   return left.split("/").length - right.split("/").length || left.localeCompare(right);
+}
+var resolverCache = /* @__PURE__ */ new WeakMap();
+function cachedWikilinkPathResolver(paths) {
+  const cached2 = resolverCache.get(paths);
+  if (cached2) return cached2;
+  const resolver = createWikilinkPathResolver(paths);
+  resolverCache.set(paths, resolver);
+  return resolver;
 }
 function createWikilinkPathResolver(paths) {
   const normalizedPaths = paths.map((candidate) => candidate.replace(/\\/g, "/"));
@@ -19838,11 +19864,13 @@ var rpcContract = defineRpcContract({
   open_markdown: {
     input: external_exports.object({
       path: external_exports.string().min(1),
-      source: openerSourceSchema
+      source: openerSourceSchema,
+      createIfMissing: external_exports.boolean().optional()
     }).strict(),
     output: external_exports.object({
       content: external_exports.string(),
-      sha256: external_exports.string()
+      sha256: external_exports.string(),
+      created: external_exports.boolean().optional()
     }).strict()
   },
   refresh_markdown: {
@@ -19891,7 +19919,9 @@ var rpcContract = defineRpcContract({
   },
   resolve_chat_wikilink: {
     input: external_exports.object({
-      threadId: external_exports.string().min(1),
+      threadId: external_exports.string().min(1).optional(),
+      source: openerSourceSchema.optional(),
+      path: external_exports.string().optional(),
       reference: external_exports.string().min(1)
     }).strict(),
     output: external_exports.object({
@@ -19912,7 +19942,9 @@ var rpcContract = defineRpcContract({
   },
   preview_chat_wikilink: {
     input: external_exports.object({
-      threadId: external_exports.string().min(1),
+      threadId: external_exports.string().min(1).optional(),
+      source: openerSourceSchema.optional(),
+      path: external_exports.string().optional(),
       reference: external_exports.string().min(1),
       backlinks: external_exports.boolean().optional()
     }).strict(),
@@ -19928,7 +19960,9 @@ var rpcContract = defineRpcContract({
   },
   autocomplete_wikilinks: {
     input: external_exports.object({
-      threadId: external_exports.string().min(1),
+      threadId: external_exports.string().min(1).optional(),
+      source: openerSourceSchema.optional(),
+      path: external_exports.string().optional(),
       query: external_exports.string().max(160)
     }).strict(),
     output: external_exports.array(
@@ -19958,6 +19992,33 @@ var BACKLINK_INDEX_TTL_MS = 45e3;
 var WEB_PREVIEW_CACHE_TTL_MS = 5 * 6e4;
 var webPreviewCache = /* @__PURE__ */ new Map();
 var backlinkIndexCache = /* @__PURE__ */ new Map();
+var LOCATION_CACHE_TTL_MS = 6e4;
+var environmentCache = /* @__PURE__ */ new Map();
+var threadStorageCache = /* @__PURE__ */ new Map();
+function memoizeLookup(cache, key, load) {
+  const now = Date.now();
+  const cached2 = cache.get(key);
+  if (cached2 && cached2.expiresAt > now) return cached2.promise;
+  const promise2 = load();
+  cache.set(key, { expiresAt: now + LOCATION_CACHE_TTL_MS, promise: promise2 });
+  promise2.catch(() => {
+    if (cache.get(key)?.promise === promise2) cache.delete(key);
+  });
+  return promise2;
+}
+function cachedEnvironment(bb, environmentId) {
+  return memoizeLookup(environmentCache, environmentId, async () => {
+    const environment = await bb.sdk.environments.get({ environmentId });
+    return { path: environment.path, hostId: environment.hostId };
+  });
+}
+function cachedThreadStorage(bb, threadId) {
+  return memoizeLookup(
+    threadStorageCache,
+    threadId,
+    () => bb.sdk.threads.storageLocation({ threadId })
+  );
+}
 function isAbsoluteHostPath(value) {
   return path3.posix.isAbsolute(value) || path3.win32.isAbsolute(value);
 }
@@ -20004,35 +20065,176 @@ function relativePathWithinRoot(rootPath, absolutePath) {
   }
   return relativePath.split(rootApi.sep).join("/");
 }
-async function exactPathExists(bb, hostId, absolutePath) {
-  const result = await bb.sdk.hosts.pathsExist({
-    hostId,
-    paths: [absolutePath]
-  });
-  return result.existence[absolutePath] ?? false;
-}
-async function resolveLocalMarkdownLink(bb, localPath, context) {
+function planLocalMarkdownLink(localPath, context) {
   if (isAbsoluteHostPath(localPath)) {
-    const absolutePath2 = normalizeHostPath(localPath);
-    const relativePath2 = relativePathWithinRoot(context.rootPath, absolutePath2);
+    const absolutePath = normalizeHostPath(localPath);
+    const relativePath2 = relativePathWithinRoot(context.rootPath, absolutePath);
     return {
       reference: localPath,
-      target: relativePath2 ? context.targetFor(relativePath2) : { kind: "host", hostId: context.hostId, path: absolutePath2 },
-      exists: await exactPathExists(bb, context.hostId, absolutePath2)
+      target: relativePath2 ? context.targetFor(relativePath2) : { kind: "host", hostId: context.hostId, path: absolutePath },
+      absolutePath
     };
   }
   const currentDirectory = path3.posix.dirname(context.currentRelativePath);
   const relativePath = requireRelativePath(
     path3.posix.join(currentDirectory, localPath.replace(/\\/g, "/"))
   );
-  const absolutePath = joinHostPath(context.rootPath, relativePath);
   return {
     reference: localPath,
     target: context.targetFor(relativePath),
-    exists: await exactPathExists(bb, context.hostId, absolutePath)
+    absolutePath: joinHostPath(context.rootPath, relativePath)
   };
 }
+async function resolveLocalMarkdownLink(bb, localPath, context) {
+  const [resolved] = await resolveLocalMarkdownLinks(bb, [localPath], context);
+  return resolved;
+}
+async function resolveLocalMarkdownLinks(bb, localPaths, context) {
+  const plans = [];
+  for (const localPath of localPaths) {
+    try {
+      plans.push(planLocalMarkdownLink(localPath, context));
+    } catch {
+      continue;
+    }
+  }
+  if (plans.length === 0) return [];
+  const { existence } = await bb.sdk.hosts.pathsExist({
+    hostId: context.hostId,
+    paths: [...new Set(plans.map((plan) => plan.absolutePath))]
+  });
+  return plans.map(({ absolutePath, ...plan }) => ({
+    ...plan,
+    exists: existence[absolutePath] ?? false
+  }));
+}
+var LINKABLE_FILE_PATTERN = /\.(?:md|markdown|tldraw)$/i;
+var LOCAL_WALK_MAX_ENTRIES = 2e5;
+var LOCAL_ROOT_PROBE_TTL_MS = 5 * 6e4;
+var localRootProbes = /* @__PURE__ */ new Map();
+async function hostRootIsLocal(bb, hostId, rootPath) {
+  const key = `${hostId}\0${rootPath}`;
+  const now = Date.now();
+  const cached2 = localRootProbes.get(key);
+  if (cached2 && cached2.expiresAt > now) return cached2.promise;
+  const promise2 = (async () => {
+    try {
+      const [remote, local] = await Promise.all([
+        bb.sdk.hosts.directory({ hostId, path: rootPath }),
+        readdir(rootPath, { withFileTypes: true })
+      ]);
+      const visible = (name) => !name.startsWith(".");
+      const localEntries = new Set(
+        local.filter((entry) => visible(entry.name)).map((entry) => `${entry.isDirectory() ? "d" : "f"}:${entry.name}`)
+      );
+      const remoteEntries = remote.entries.filter(
+        (entry) => visible(entry.name)
+      );
+      const matches = remoteEntries.length === localEntries.size && remoteEntries.every(
+        (entry) => localEntries.has(
+          `${entry.kind === "directory" ? "d" : "f"}:${entry.name}`
+        )
+      );
+      bb.log.debug(
+        `Local index ${matches ? "enabled" : "disabled"} for ${rootPath} (host ${remoteEntries.length} vs local ${localEntries.size} entries)`
+      );
+      return matches;
+    } catch (error61) {
+      bb.log.debug(
+        `Local index probe failed for ${rootPath}: ${error61 instanceof Error ? error61.message : String(error61)}`
+      );
+      return false;
+    }
+  })();
+  localRootProbes.set(key, {
+    expiresAt: now + LOCAL_ROOT_PROBE_TTL_MS,
+    promise: promise2
+  });
+  return promise2;
+}
+var REFRESH_MEMO_LIMIT = 256;
+var refreshMemo = /* @__PURE__ */ new Map();
+async function unchangedNoteSha(bb, context) {
+  if (!await hostRootIsLocal(bb, context.hostId, context.rootPath)) return null;
+  const memoized = refreshMemo.get(`${context.hostId}\0${context.absolutePath}`);
+  if (!memoized) return null;
+  try {
+    const stats = await stat(context.absolutePath);
+    return stats.mtimeMs === memoized.mtimeMs && stats.size === memoized.size ? memoized.sha256 : null;
+  } catch {
+    return null;
+  }
+}
+async function rememberNoteSha(bb, context, sha256, sizeBytes, stats) {
+  if (!await hostRootIsLocal(bb, context.hostId, context.rootPath)) return;
+  try {
+    const current = stats ?? await stat(context.absolutePath);
+    if (sizeBytes !== void 0 && current.size !== sizeBytes) return;
+    const key = `${context.hostId}\0${context.absolutePath}`;
+    refreshMemo.delete(key);
+    refreshMemo.set(key, {
+      mtimeMs: current.mtimeMs,
+      size: current.size,
+      sha256
+    });
+    if (refreshMemo.size > REFRESH_MEMO_LIMIT) {
+      refreshMemo.delete(refreshMemo.keys().next().value);
+    }
+  } catch {
+  }
+}
+function sha256Hex(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+async function readLocalNote(bb, context) {
+  if (!await hostRootIsLocal(bb, context.hostId, context.rootPath)) return null;
+  try {
+    const before = await stat(context.absolutePath);
+    if (before.isDirectory()) return null;
+    const bytes = await readFile(context.absolutePath);
+    const after = await stat(context.absolutePath);
+    const sha256 = sha256Hex(bytes);
+    if (before.mtimeMs === after.mtimeMs && before.size === after.size) {
+      void rememberNoteSha(bb, context, sha256, bytes.length, after);
+    }
+    return { content: bytes.toString("utf8"), sha256 };
+  } catch {
+    return null;
+  }
+}
+async function walkLinkablePaths(rootPath) {
+  const paths = [];
+  const visit2 = async (directory, base) => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    const subdirectories = [];
+    for (const entry of entries) {
+      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+      const relativePath = base ? `${base}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        subdirectories.push([path3.join(directory, entry.name), relativePath]);
+      } else if (LINKABLE_FILE_PATTERN.test(entry.name)) {
+        if (paths.length >= LOCAL_WALK_MAX_ENTRIES) {
+          throw new RangeError("Vault is too large to index locally");
+        }
+        paths.push(relativePath);
+      }
+    }
+    await Promise.all(
+      subdirectories.map(([child, childBase]) => visit2(child, childBase))
+    );
+  };
+  try {
+    await visit2(rootPath, "");
+    return paths;
+  } catch {
+    return null;
+  }
+}
 async function listLinkablePaths(bb, hostId, rootPath, query) {
+  if (!query && await hostRootIsLocal(bb, hostId, rootPath)) {
+    const walked = await walkLinkablePaths(rootPath);
+    if (walked) return { paths: walked, truncated: false };
+  }
   const index = await bb.sdk.files.listPaths({
     hostId,
     path: rootPath,
@@ -20043,28 +20245,72 @@ async function listLinkablePaths(bb, hostId, rootPath, query) {
   });
   return {
     paths: index.paths.filter(
-      (entry) => entry.kind === "file" && /\.(?:md|markdown|tldraw)$/i.test(entry.path)
+      (entry) => entry.kind === "file" && LINKABLE_FILE_PATTERN.test(entry.path)
     ).map((entry) => entry.path.replace(/\\/g, "/")),
     truncated: index.truncated
   };
 }
+var targetedIndexes = /* @__PURE__ */ new WeakMap();
+function targetedLinkablePaths(bb, context, reference) {
+  let cache = targetedIndexes.get(bb);
+  if (!cache) targetedIndexes.set(bb, cache = /* @__PURE__ */ new Map());
+  const query = wikilinkSearchQuery(reference);
+  const key = `${context.hostId}\0${context.rootPath}\0${query}`;
+  const cached2 = cache.get(key);
+  if (cached2 && cached2.expiresAt > Date.now()) return cached2.promise;
+  const entry = {
+    expiresAt: Number.POSITIVE_INFINITY,
+    promise: listLinkablePaths(bb, context.hostId, context.rootPath, query)
+  };
+  cache.set(key, entry);
+  if (cache.size > 512) cache.delete(cache.keys().next().value);
+  entry.promise.then(
+    () => {
+      entry.expiresAt = Date.now() + AUTOCOMPLETE_CACHE_TTL_MS;
+    },
+    () => {
+      if (cache.get(key) === entry) cache.delete(key);
+    }
+  );
+  return entry.promise;
+}
+function isExactWikilinkMatch(reference, currentPath, resolvedPath) {
+  const requested = wikilinkSearchQuery(reference).replace(/\\/g, "/");
+  if (!requested) return true;
+  const withExtension = (value) => /\.(?:md|markdown|tldraw)$/i.test(value) ? value : `${value}.md`;
+  const direct = withExtension(path3.posix.normalize(requested.replace(/^\/+/, "")).replace(/^(?:\.\.\/)+/, ""));
+  const relative = withExtension(path3.posix.normalize(path3.posix.join(path3.posix.dirname(currentPath), requested)));
+  const actual = resolvedPath.toLocaleLowerCase();
+  return actual === direct.toLocaleLowerCase() || actual === relative.toLocaleLowerCase();
+}
 function wikilinkSearchQuery(reference) {
   return normalizeWikilinkReference(reference).split("#", 1)[0].trim();
 }
-async function resolveChatWikilink(bb, threadId, reference) {
-  const context = await resolveThreadContext(bb, threadId);
+async function resolveReferenceContext(bb, scope) {
+  if (scope.threadId) return resolveThreadContext(bb, scope.threadId);
+  if (scope.source && typeof scope.path === "string") {
+    try {
+      return await resolveOpenContext(bb, scope.source, scope.path);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+async function resolveChatWikilink(bb, scope, reference) {
+  const context = await resolveReferenceContext(bb, scope);
   if (!context) return { target: null, exists: false };
   const localPath = decodeLocalMarkdownPath(reference);
   if (localPath) {
     const resolved2 = await resolveLocalMarkdownLink(bb, localPath, context);
     return { target: resolved2.target, exists: resolved2.exists };
   }
-  const index = await listLinkablePaths(
-    bb,
-    context.hostId,
-    context.rootPath,
-    wikilinkSearchQuery(reference)
-  );
+  const cached2 = autocompleteIndexCache.get(`${context.hostId}\0${context.rootPath}`);
+  let index = cached2 ? await cachedAutocompleteIndex(bb, context) : null;
+  const known = index && resolveWikilinkPath(reference, context.currentRelativePath, index.paths);
+  if (!index || index.truncated && (!known?.exists || !isExactWikilinkMatch(reference, context.currentRelativePath, known.path))) {
+    index = await targetedLinkablePaths(bb, context, reference);
+  }
   const resolved = resolveWikilinkPath(
     reference,
     context.currentRelativePath,
@@ -20224,9 +20470,9 @@ async function cachedAutocompleteIndex(bb, context) {
   promise2.catch(() => autocompleteIndexCache.delete(cacheKey));
   return promise2;
 }
-async function autocompleteWikilinks(bb, threadId, query) {
+async function autocompleteWikilinks(bb, scope, query) {
   const normalizedQuery = query.trim();
-  const context = await resolveThreadContext(bb, threadId);
+  const context = await resolveReferenceContext(bb, scope);
   if (!context) return [];
   const index = await cachedAutocompleteIndex(bb, context);
   if (normalizedQuery === "") return [];
@@ -20257,6 +20503,12 @@ async function autocompleteWikilinks(bb, threadId, query) {
   }).slice(0, 12).map(({ score: _score, ...suggestion }) => suggestion);
 }
 async function readUtf8File(bb, hostId, absolutePath, rootPath) {
+  if (await hostRootIsLocal(bb, hostId, rootPath)) {
+    try {
+      return await readFile(absolutePath, "utf8");
+    } catch {
+    }
+  }
   const file2 = await bb.sdk.files.read({
     hostId,
     path: absolutePath,
@@ -20265,6 +20517,12 @@ async function readUtf8File(bb, hostId, absolutePath, rootPath) {
   return file2.contentEncoding === "base64" ? Buffer.from(file2.content, "base64").toString("utf8") : file2.content;
 }
 async function readFileBuffer(bb, hostId, absolutePath, rootPath) {
+  if (await hostRootIsLocal(bb, hostId, rootPath)) {
+    try {
+      return await readFile(absolutePath);
+    } catch {
+    }
+  }
   const file2 = await bb.sdk.files.read({
     hostId,
     path: absolutePath,
@@ -20277,17 +20535,13 @@ function noteTitle(filePath) {
 }
 async function readBacklinkSource(bb, context, relativePath) {
   const absolutePath = joinHostPath(context.rootPath, relativePath);
-  try {
-    return await readFile(absolutePath, "utf8");
-  } catch {
-    return readUtf8File(bb, context.hostId, absolutePath, context.rootPath);
-  }
+  return readUtf8File(bb, context.hostId, absolutePath, context.rootPath);
 }
 async function buildBacklinkIndex(bb, context, availablePaths) {
   const markdownPaths = availablePaths.filter(
     (filePath) => /\.(?:md|markdown)$/i.test(filePath)
   );
-  const resolvePath = createWikilinkPathResolver(availablePaths);
+  const resolvePath = cachedWikilinkPathResolver(availablePaths);
   const backlinks = /* @__PURE__ */ new Map();
   let cursor = 0;
   const workers = Array.from(
@@ -20328,22 +20582,42 @@ async function buildBacklinkIndex(bb, context, availablePaths) {
   }
   return backlinks;
 }
+function backlinkIndex(bb, context, cacheKey) {
+  const now = Date.now();
+  const cached2 = backlinkIndexCache.get(cacheKey);
+  const build = () => cachedAutocompleteIndex(bb, context).then(
+    (index) => buildBacklinkIndex(bb, context, index.paths)
+  );
+  if (cached2) {
+    if (cached2.expiresAt <= now) {
+      cached2.expiresAt = now + BACKLINK_INDEX_TTL_MS;
+      build().then(
+        (fresh) => backlinkIndexCache.set(cacheKey, {
+          expiresAt: Date.now() + BACKLINK_INDEX_TTL_MS,
+          promise: Promise.resolve(fresh)
+        }),
+        () => {
+          cached2.expiresAt = Date.now() + BACKLINK_INDEX_TTL_MS;
+        }
+      );
+    }
+    return cached2.promise;
+  }
+  const promise2 = build();
+  backlinkIndexCache.set(cacheKey, {
+    expiresAt: now + BACKLINK_INDEX_TTL_MS,
+    promise: promise2
+  });
+  promise2.catch(() => backlinkIndexCache.delete(cacheKey));
+  return promise2;
+}
+function expireBacklinkIndex(cacheKey) {
+  const cached2 = backlinkIndexCache.get(cacheKey);
+  if (cached2) cached2.expiresAt = 0;
+}
 async function contextualBacklinks(bb, context) {
   const cacheKey = `${context.hostId}\0${context.rootPath}`;
-  const now = Date.now();
-  let cached2 = backlinkIndexCache.get(cacheKey);
-  if (!cached2 || cached2.expiresAt <= now) {
-    const promise2 = cachedAutocompleteIndex(bb, context).then(
-      (index2) => buildBacklinkIndex(bb, context, index2.paths)
-    );
-    cached2 = {
-      expiresAt: now + BACKLINK_INDEX_TTL_MS,
-      promise: promise2
-    };
-    backlinkIndexCache.set(cacheKey, cached2);
-    promise2.catch(() => backlinkIndexCache.delete(cacheKey));
-  }
-  const index = await cached2.promise;
+  const index = await backlinkIndex(bb, context, cacheKey);
   const all = (index.get(context.currentRelativePath.toLocaleLowerCase()) ?? []).filter(
     (entry) => entry.sourcePath.toLocaleLowerCase() !== context.currentRelativePath.toLocaleLowerCase()
   );
@@ -20411,12 +20685,13 @@ async function previewFile(bb, target, showBacklinks = false) {
       ),
       cachedAutocompleteIndex(bb, context)
     ]);
-    const excerpt = createMarkdownExcerpt(content);
+    const body = stripYamlFrontmatter(content).trimStart();
     return {
-      ...excerpt,
+      content: body,
+      truncated: false,
       imageDataUrl: null,
       backlinks: null,
-      links: await resolveLinks(bb, excerpt.content, context, index)
+      links: await resolveLinks(bb, body, context, index)
     };
   } catch {
     return {
@@ -20430,9 +20705,7 @@ async function previewFile(bb, target, showBacklinks = false) {
 }
 async function resolveTargetContext(bb, target) {
   if (target.kind === "workspace") {
-    const environment = await bb.sdk.environments.get({
-      environmentId: target.environmentId
-    });
+    const environment = await cachedEnvironment(bb, target.environmentId);
     if (!environment.path || !environment.hostId) {
       throw new Error("This environment has no readable workspace");
     }
@@ -20451,9 +20724,7 @@ async function resolveTargetContext(bb, target) {
   }
   if (target.kind === "thread-storage") {
     const currentRelativePath = requireRelativePath(target.path);
-    const storage = await bb.sdk.threads.storageLocation({
-      threadId: target.threadId
-    });
+    const storage = await cachedThreadStorage(bb, target.threadId);
     const rootPath2 = normalizeHostPath(storage.storageRootPath);
     return {
       absolutePath: joinHostPath(rootPath2, currentRelativePath),
@@ -20486,23 +20757,22 @@ async function resolveTargetContext(bb, target) {
   };
 }
 async function resolveLinks(bb, content, context, index) {
+  const resolveIndexedPath = cachedWikilinkPathResolver(index.paths);
   const wikilinks = extractWikilinkReferences(content).map(
     async (reference) => {
       let availablePaths = index.paths;
-      if (index.truncated) {
-        const targetedIndex = await listLinkablePaths(
-          bb,
-          context.hostId,
-          context.rootPath,
-          wikilinkSearchQuery(reference)
-        );
+      const indexedPath = resolveIndexedPath(reference, context.currentRelativePath);
+      if (index.truncated && (!indexedPath || !isExactWikilinkMatch(reference, context.currentRelativePath, indexedPath))) {
+        const targetedIndex = await targetedLinkablePaths(bb, context, reference);
         availablePaths = [...targetedIndex.paths, ...index.paths];
       }
-      const resolved2 = resolveWikilinkPath(
-        reference,
-        context.currentRelativePath,
-        availablePaths
-      );
+      const resolved2 = availablePaths === index.paths ? indexedPath ? { path: indexedPath, exists: true } : (
+        // The index is complete here, so the miss is final: no rescan.
+        {
+          path: wikilinkFallbackPath(reference, context.currentRelativePath),
+          exists: false
+        }
+      ) : resolveWikilinkPath(reference, context.currentRelativePath, availablePaths);
       return {
         reference,
         target: context.targetFor(resolved2.path),
@@ -20510,17 +20780,21 @@ async function resolveLinks(bb, content, context, index) {
       };
     }
   );
-  const markdownLinks = extractLocalMarkdownPaths(content).map(
-    (localPath) => resolveLocalMarkdownLink(bb, localPath, context)
+  const markdownLinks = resolveLocalMarkdownLinks(
+    bb,
+    extractLocalMarkdownPaths(content),
+    context
   );
-  const resolved = await Promise.all([...wikilinks, ...markdownLinks]);
+  const [resolvedWikilinks, resolvedMarkdownLinks] = await Promise.all([
+    Promise.all(wikilinks),
+    markdownLinks
+  ]);
+  const resolved = [...resolvedWikilinks, ...resolvedMarkdownLinks];
   return [...new Map(resolved.map((link) => [link.reference, link])).values()];
 }
 async function resolveOpenContext(bb, source, filePath) {
   if (source.kind === "workspace" && source.environmentId) {
-    const environment = await bb.sdk.environments.get({
-      environmentId: source.environmentId
-    });
+    const environment = await cachedEnvironment(bb, source.environmentId);
     if (!environment.path || !environment.hostId) {
       throw new Error("This environment has no readable workspace");
     }
@@ -20593,9 +20867,7 @@ async function resolveOpenContext(bb, source, filePath) {
       throw new Error("Thread-storage files require a thread ID");
     }
     const currentRelativePath = requireRelativePath(filePath);
-    const storage = await bb.sdk.threads.storageLocation({
-      threadId: source.threadId
-    });
+    const storage = await cachedThreadStorage(bb, source.threadId);
     const rootPath = normalizeHostPath(storage.storageRootPath);
     return {
       absolutePath: joinHostPath(rootPath, currentRelativePath),
@@ -20615,6 +20887,10 @@ async function plugin(bb) {
   autocompleteIndexCache.clear();
   backlinkIndexCache.clear();
   webPreviewCache.clear();
+  localRootProbes.clear();
+  refreshMemo.clear();
+  environmentCache.clear();
+  threadStorageCache.clear();
   bb.settings.define({
     documentBacklinks: {
       type: "boolean",
@@ -20626,26 +20902,92 @@ async function plugin(bb) {
   const trailDatabase = bb.storage.database();
   bb.storage.migrate(trailDatabase, thinkingTrailMigrations);
   bb.rpc.register(rpcContract, {
-    async open_markdown({ path: filePath, source }) {
+    async open_markdown({ path: filePath, source, createIfMissing }) {
       const context = await resolveOpenContext(bb, source, filePath);
-      const file2 = await bb.sdk.files.read({
+      const args = {
         hostId: context.hostId,
         path: context.absolutePath,
         rootPath: context.rootPath
-      });
-      const content = file2.contentEncoding === "base64" ? Buffer.from(file2.content, "base64").toString("utf8") : file2.content;
+      };
+      let created = false;
+      let file2;
+      try {
+        file2 = await bb.sdk.files.read(args);
+      } catch (error61) {
+        if (!createIfMissing || !/\.(md|markdown)$/i.test(filePath)) throw error61;
+        const { existence } = await bb.sdk.hosts.pathsExist({
+          hostId: context.hostId,
+          paths: [context.absolutePath]
+        });
+        if (existence[context.absolutePath] !== false) throw error61;
+        const written = await bb.sdk.files.write({
+          ...args,
+          content: "",
+          contentEncoding: "utf8",
+          createParents: true,
+          expectedSha256: null
+        });
+        created = written.outcome === "written";
+        autocompleteIndexCache.delete(`${context.hostId}\0${context.rootPath}`);
+        expireBacklinkIndex(`${context.hostId}\0${context.rootPath}`);
+        file2 = await bb.sdk.files.read(args);
+      }
+      void rememberNoteSha(bb, context, file2.sha256, file2.sizeBytes);
       return {
-        content,
-        sha256: file2.sha256
+        content: file2.contentEncoding === "base64" ? Buffer.from(file2.content, "base64").toString("utf8") : file2.content,
+        sha256: file2.sha256,
+        ...created ? { created: true } : {}
       };
     },
     async refresh_markdown({ path: filePath, source, knownSha256 }) {
-      const context = await resolveOpenContext(bb, source, filePath);
-      const file2 = await bb.sdk.files.read({
-        hostId: context.hostId,
-        path: context.absolutePath,
-        rootPath: context.rootPath
+      const controller = new AbortController();
+      const startedAt = Date.now();
+      let stage = "resolve context";
+      let timer;
+      const deadline = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const error61 = new Error(`Markdown refresh timed out during ${stage}`);
+          reject(error61);
+          controller.abort(error61);
+        }, 5e3);
       });
+      const read = async () => {
+        const context2 = await resolveOpenContext(bb, source, filePath);
+        controller.signal.throwIfAborted();
+        stage = "read file";
+        const unchangedSha = await unchangedNoteSha(bb, context2);
+        if (unchangedSha !== null && unchangedSha === knownSha256) return { unchangedSha, context: context2 };
+        const local = await readLocalNote(bb, context2);
+        if (local) return { local, context: context2 };
+        controller.signal.throwIfAborted();
+        const file3 = await bb.sdk.files.read({
+          hostId: context2.hostId,
+          path: context2.absolutePath,
+          rootPath: context2.rootPath,
+          signal: controller.signal
+        });
+        return { file: file3, context: context2 };
+      };
+      let result;
+      try {
+        result = await Promise.race([read(), deadline]);
+      } catch (error61) {
+        bb.log.warn(
+          `Markdown refresh failed (${stage}, ${Date.now() - startedAt}ms): ${error61 instanceof Error ? error61.message : String(error61)}`
+        );
+        throw error61;
+      } finally {
+        clearTimeout(timer);
+      }
+      if ("unchangedSha" in result) {
+        return { changed: false, sha256: result.unchangedSha };
+      }
+      if ("local" in result) {
+        const { local } = result;
+        return local.sha256 === knownSha256 ? { changed: false, sha256: local.sha256 } : { changed: true, content: local.content, sha256: local.sha256 };
+      }
+      const { file: file2, context } = result;
+      void rememberNoteSha(bb, context, file2.sha256, file2.sizeBytes);
       if (file2.sha256 === knownSha256) {
         return { changed: false, sha256: file2.sha256 };
       }
@@ -20679,14 +21021,20 @@ async function plugin(bb) {
       if (result.outcome === "conflict") {
         return result;
       }
-      backlinkIndexCache.delete(`${context.hostId}\0${context.rootPath}`);
+      expireBacklinkIndex(`${context.hostId}\0${context.rootPath}`);
+      void rememberNoteSha(
+        bb,
+        context,
+        result.sha256,
+        Buffer.byteLength(content, "utf8")
+      );
       return {
         outcome: "written",
         sha256: result.sha256
       };
     },
-    async resolve_chat_wikilink({ threadId, reference }) {
-      return resolveChatWikilink(bb, threadId, reference);
+    async resolve_chat_wikilink({ threadId, source, path: path4, reference }) {
+      return resolveChatWikilink(bb, { threadId, source, path: path4 }, reference);
     },
     async preview_file({ target, backlinks }) {
       return previewFile(bb, target, backlinks);
@@ -20694,8 +21042,18 @@ async function plugin(bb) {
     async preview_url({ url: url2 }) {
       return cachedWebPreview(url2);
     },
-    async preview_chat_wikilink({ threadId, reference, backlinks }) {
-      const resolved = await resolveChatWikilink(bb, threadId, reference);
+    async preview_chat_wikilink({
+      threadId,
+      source,
+      path: path4,
+      reference,
+      backlinks
+    }) {
+      const resolved = await resolveChatWikilink(
+        bb,
+        { threadId, source, path: path4 },
+        reference
+      );
       const preview = resolved.target ? await previewFile(bb, resolved.target, backlinks) : {
         content: null,
         imageDataUrl: null,
@@ -20709,8 +21067,8 @@ async function plugin(bb) {
         ...preview
       };
     },
-    async autocomplete_wikilinks({ threadId, query }) {
-      return autocompleteWikilinks(bb, threadId, query);
+    async autocomplete_wikilinks({ threadId, source, path: path4, query }) {
+      return autocompleteWikilinks(bb, { threadId, source, path: path4 }, query);
     },
     async record_thinking_trail({ trail }) {
       return { id: recordThinkingTrail(trailDatabase, trail) };
@@ -20751,7 +21109,7 @@ async function plugin(bb) {
   bb.agents.configure(() => ({
     tools: ["query_thinking_trails"],
     skills: ["obsidian-at-home"],
-    instructions: "Thinking trails record note paths the user explored. Hover indicates curiosity; a clicked step is a stronger attention signal. Query them when reconstructing prior working context would help."
+    instructions: "Thinking trails record note paths the user explored. Hover indicates curiosity; a clicked step is a stronger attention signal. Query them when reconstructing prior working context would help. When writing aliased wikilinks inside Markdown table cells, escape the alias pipe with one backslash: [[Note title\\|Display text]]. Outside tables use [[Note title|Display text]]."
   }));
 }
 export {

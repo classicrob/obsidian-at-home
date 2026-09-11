@@ -1,4 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
   createFakePluginHost,
   experimental_scanPublicSdkOnly,
@@ -36,24 +40,162 @@ function storedZip(fileName: string, content: Buffer): Buffer {
 }
 
 describe("wikilinks server", () => {
-  it("makes the bundled usage skill and trail tool available to new sessions", async () => {
+  it("reuses indexed links and shares missing-link searches across concurrent previews", async () => {
+    const queries: Array<string | undefined> = [];
+    const content = "[[Known]] [[notes/Details]] [[Missing#one]] [[Missing#two]]";
     const { bb, harness } = createFakePluginHost({
       pluginId: "wikilinks",
-      agentSkillIds: ["obsidian-at-home"],
+      sdk: {
+        environments: { get: async () => ({ path: "/perf-vault", hostId: "perf-host" }) as never },
+        files: {
+          read: async () => ({ content, contentEncoding: "utf8", sha256: "test", sizeBytes: content.length }) as never,
+          listPaths: async ({ query }) => {
+            queries.push(query);
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            return {
+              paths: (query === "notes/Details" ? ["notes/Details.md"] : query ? [] : ["Known.md", "archive/Details.md"])
+                .map((path) => ({ kind: "file", path })),
+              truncated: !query,
+            } as never;
+          },
+        },
+      },
     });
     await plugin(bb);
-    const configuration = await harness.behavior.resolveAgentConfiguration({
-      thread: { id: "thread-1", title: "Notes", parentThreadId: null, sourceThreadId: null },
-      project: { id: "project-1", kind: "standard", name: "Notes", gitRemoteUrl: null },
-      environment: { id: "env-1", name: null, path: "/notes", workspaceProvisionType: "unmanaged", branchName: null },
-      host: { id: "host-1", name: "Local" },
-      provider: { id: "codex", model: "test", capabilities: { supportsNativeUserQuestion: true } },
-      origin: { kind: null, pluginId: null },
-    });
-    expect(configuration.skills).toEqual(["obsidian-at-home"]);
-    expect(configuration.tools.map((tool) => tool.name)).toEqual(["query_thinking_trails"]);
-    expect(configuration.instructions).toContain("Hover indicates curiosity");
+    const input = { target: { kind: "workspace", environmentId: "perf-env", path: "Note.md" } };
+    const results = await Promise.all([
+      harness.behavior.callRpc("preview_file", input),
+      harness.behavior.callRpc("preview_file", input),
+    ]);
+    expect(results[0]).toEqual(results[1]);
+    expect(results[0]).toMatchObject({ content, links: [
+      { reference: "Known", exists: true, target: { path: "Known.md" } },
+      { reference: "notes/Details", exists: true, target: { path: "notes/Details.md" } },
+      { reference: "Missing#one", exists: false },
+      { reference: "Missing#two", exists: false },
+    ] });
+    expect(queries).toEqual([undefined, "notes/Details", "Missing"]);
+    await harness.behavior.callRpc("preview_file", input);
+    expect(queries).toHaveLength(3);
     await harness.lifecycle.dispose();
+  });
+
+  it("indexes a locally readable vault off disk instead of searching the host per link", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "wikilinks-vault-"));
+    await mkdir(path.join(root, "notes"));
+    await mkdir(path.join(root, ".obsidian"));
+    const content = "[[Known]] [[Details]] [[Missing]]";
+    await writeFile(path.join(root, "Note.md"), content, "utf8");
+    await writeFile(path.join(root, "Known.md"), "known", "utf8");
+    await writeFile(path.join(root, "notes", "Details.md"), "details", "utf8");
+    await writeFile(path.join(root, ".obsidian", "workspace.md"), "hidden", "utf8");
+    const listPaths = vi.fn();
+    const read = vi.fn();
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "wikilinks",
+      sdk: {
+        environments: {
+          get: async () => ({ path: root, hostId: "local-host" }) as never,
+        },
+        hosts: {
+          directory: async () => ({
+            directory: root,
+            parent: null,
+            entries: (await readdir(root, { withFileTypes: true })).map(
+              (entry) => ({
+                kind: entry.isDirectory() ? "directory" : "file",
+                name: entry.name,
+                path: path.join(root, entry.name),
+              }),
+            ),
+          }) as never,
+          pathsExist: async () => ({ existence: {} }) as never,
+        },
+        files: { listPaths, read },
+      },
+    });
+    await plugin(bb);
+    const preview = await harness.behavior.callRpc("preview_file", {
+      target: { kind: "workspace", environmentId: "local-env", path: "Note.md" },
+    });
+
+    expect(preview).toMatchObject({
+      content,
+      links: [
+        { reference: "Known", exists: true, target: { path: "Known.md" } },
+        { reference: "Details", exists: true, target: { path: "notes/Details.md" } },
+        { reference: "Missing", exists: false },
+      ],
+    });
+    // The whole point: no host listing, no per-reference search, no host read.
+    expect(listPaths).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+    await harness.lifecycle.dispose();
+  });
+
+  it("refreshes a locally readable note from disk and answers later polls from a stat", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "wikilinks-refresh-"));
+    const notePath = path.join(root, "Live.md");
+    await writeFile(notePath, "one\n", "utf8");
+    const hexSha = (value: string) => createHash("sha256").update(value).digest("hex");
+    const read = vi.fn(async () => {
+      const content = await readFile(notePath, "utf8");
+      return { content, contentEncoding: "utf8", sha256: hexSha(content), sizeBytes: Buffer.byteLength(content) } as never;
+    });
+    const write = vi.fn(async ({ content }: { content: string }) => {
+      await writeFile(notePath, content, "utf8");
+      return { outcome: "written", sha256: hexSha(content), sizeBytes: Buffer.byteLength(content) } as never;
+    });
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "wikilinks",
+      sdk: {
+        environments: { get: async () => ({ path: root, hostId: "local-host" }) as never },
+        hosts: {
+          directory: async () => ({
+            directory: root,
+            parent: null,
+            entries: (await readdir(root, { withFileTypes: true })).map((entry) => ({
+              kind: entry.isDirectory() ? "directory" : "file",
+              name: entry.name,
+              path: path.join(root, entry.name),
+            })),
+          }) as never,
+        },
+        files: { read, write },
+      },
+    });
+    try {
+      await plugin(bb);
+      const source = { kind: "workspace" as const, threadId: null, environmentId: "local-env", projectId: null };
+      const opened = await harness.behavior.callRpc("open_markdown", { path: "Live.md", source });
+      expect(opened).toEqual({ content: "one\n", sha256: hexSha("one\n") });
+      expect(read).toHaveBeenCalledTimes(1);
+
+      // Unchanged: answered from the memo the open filled, no host read.
+      await expect(harness.behavior.callRpc("refresh_markdown", { path: "Live.md", source, knownSha256: hexSha("one\n") }))
+        .resolves.toEqual({ changed: false, sha256: hexSha("one\n") });
+
+      // Changed on disk: hashed locally with the host's hex format.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await writeFile(notePath, "one\ntwo\n", "utf8");
+      await expect(harness.behavior.callRpc("refresh_markdown", { path: "Live.md", source, knownSha256: hexSha("one\n") }))
+        .resolves.toEqual({ changed: true, content: "one\ntwo\n", sha256: hexSha("one\ntwo\n") });
+      await expect(harness.behavior.callRpc("refresh_markdown", { path: "Live.md", source, knownSha256: hexSha("one\ntwo\n") }))
+        .resolves.toEqual({ changed: false, sha256: hexSha("one\ntwo\n") });
+
+      // A second editor can still hold the old sha after another poll updated the memo.
+      await expect(harness.behavior.callRpc("refresh_markdown", { path: "Live.md", source, knownSha256: hexSha("one\n") }))
+        .resolves.toEqual({ changed: true, content: "one\ntwo\n", sha256: hexSha("one\ntwo\n") });
+
+      // A save re-primes the memo with the written sha.
+      await expect(harness.behavior.callRpc("save_markdown", { path: "Live.md", source, content: "saved\n", expectedSha256: hexSha("one\ntwo\n") }))
+        .resolves.toEqual({ outcome: "written", sha256: hexSha("saved\n") });
+      await expect(harness.behavior.callRpc("refresh_markdown", { path: "Live.md", source, knownSha256: hexSha("saved\n") }))
+        .resolves.toEqual({ changed: false, sha256: hexSha("saved\n") });
+      expect(read).toHaveBeenCalledTimes(1);
+    } finally {
+      await harness.lifecycle.dispose();
+    }
   });
 
   it("stores branching thinking trails and joins click-through continuations", async () => {
@@ -175,9 +317,65 @@ describe("wikilinks server", () => {
     await harness.lifecycle.dispose();
   });
 
+  it("aborts a stalled refresh read within five seconds and allows the next read", async () => {
+    vi.useFakeTimers();
+    let readSignal: AbortSignal | undefined;
+    const { bb, harness } = createFakePluginHost({ pluginId: "wikilinks", sdk: {
+      files: { read: async ({ signal }) => {
+        readSignal = signal;
+        return await new Promise<never>(() => {});
+      } },
+    } });
+    try {
+      await plugin(bb);
+      const input = {
+        path: "/notes/Test.md",
+        source: { kind: "host", threadId: null, environmentId: null, projectId: null, experimental_hostId: "host-1" },
+        knownSha256: "old",
+      };
+      const pending = harness.behavior.callRpc("refresh_markdown", input);
+      const rejected = expect(pending).rejects.toThrow(/timed out/i);
+      await vi.advanceTimersByTimeAsync(5_001);
+      await rejected;
+      expect(readSignal?.aborted).toBe(true);
+      harness.inspection.sdk.stub("files.read", async () => ({ content: "New segment", contentEncoding: "utf8", sha256: "new", sizeBytes: 11 }) as never);
+      await expect(harness.behavior.callRpc("refresh_markdown", input)).resolves.toEqual({ changed: true, content: "New segment", sha256: "new" });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await harness.lifecycle.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds context lookup and does not start a read after its deadline", async () => {
+    vi.useFakeTimers();
+    let finish!: (value: never) => void;
+    const { bb, harness } = createFakePluginHost({ pluginId: "wikilinks", sdk: {
+      environments: { get: () => new Promise<never>((resolve) => { finish = resolve; }) },
+    } });
+    try {
+      await plugin(bb);
+      const pending = harness.behavior.callRpc("refresh_markdown", {
+        path: "Test.md",
+        source: { kind: "workspace", threadId: null, environmentId: "env-1", projectId: null },
+        knownSha256: "old",
+      });
+      const rejected = expect(pending).rejects.toThrow("timed out during resolve context");
+      await vi.advanceTimersByTimeAsync(5_001);
+      await rejected;
+      finish({ path: "/notes", hostId: "host-1" } as never);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.inspection.sdk.callsTo("files.read")).toHaveLength(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await harness.lifecycle.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it("loads Markdown and resolves links to native workspace targets", async () => {
     const content =
-      "Read [[Strategy]], [[Roadmap|the roadmap]], [[Canvas.tldraw|the canvas]], and [Example document.md](/workspace/Example%20document.md).";
+      "Read [[Strategy]], [[Roadmap|the roadmap]], [[Canvas.tldraw|the canvas]], and [Continual learning.md](/workspace/Continual%20learning.md).";
     const { bb, harness } = createFakePluginHost({
       pluginId: "wikilinks",
       sdk: {
@@ -210,7 +408,7 @@ describe("wikilinks server", () => {
             existence: Object.fromEntries(
               paths.map((filePath) => [
                 filePath,
-                filePath === "/workspace/Example document.md",
+                filePath === "/workspace/Continual learning.md",
               ]),
             ),
           }) as never,
@@ -303,11 +501,11 @@ describe("wikilinks server", () => {
           exists: true,
         },
         {
-          reference: "/workspace/Example document.md",
+          reference: "/workspace/Continual learning.md",
           target: {
             kind: "workspace",
             environmentId: "env-1",
-            path: "Example document.md",
+            path: "Continual learning.md",
           },
           exists: true,
         },
@@ -316,9 +514,9 @@ describe("wikilinks server", () => {
     await harness.lifecycle.dispose();
   });
 
-  it("resolves chat wikilinks against the thread workspace", async () => {
-    const content =
-      "---\ntitle: Strategy\ntags: [work]\n---\n# Strategy\n\nA useful note. See [[notes/Details]].";
+  it.each([0, 10_000])("resolves chat wikilinks and previews the complete note with %i extra characters", async (length) => {
+    const body = `# Strategy\n\n${"x".repeat(length)}A useful note. See [[notes/Details]].`;
+    const content = `---\ntitle: Strategy\ntags: [work]\n---\n${body}`;
     const { bb, harness } = createFakePluginHost({
       pluginId: "wikilinks",
       sdk: {
@@ -418,7 +616,7 @@ describe("wikilinks server", () => {
         path: "notes/Strategy.md",
       },
       exists: true,
-      content: "# Strategy\n\nA useful note. See [[notes/Details]].",
+      content: body,
       imageDataUrl: null,
       backlinks: null,
       truncated: false,
@@ -677,10 +875,10 @@ describe("wikilinks server", () => {
               paths: [
                 {
                   kind: "file",
-                  path: "examples/Planning team workshops for the next quarter.md",
+                  path: "websim/I- Prompt arenas into existence to create a market for model capabilities.md",
                 },
-                { kind: "file", path: "examples/Workshop planning.md" },
-                { kind: "file", path: "concepts/Meeting formats.md" },
+                { kind: "file", path: "websim/Prompt engineering.md" },
+                { kind: "file", path: "concepts/Capability markets.md" },
               ],
               truncated: false,
             } as never;
@@ -694,23 +892,23 @@ describe("wikilinks server", () => {
       "autocomplete_wikilinks",
       {
         threadId: "thread-fuzzy",
-        query: "workshop team",
+        query: "arena prompt",
       },
     )) as Array<{ reference: string; label: string; directory: string }>;
     const mistyped = (await harness.behavior.callRpc(
       "autocomplete_wikilinks",
       {
         threadId: "thread-fuzzy",
-        query: "tem workshp",
+        query: "prmpt arna",
       },
     )) as Array<{ reference: string; label: string; directory: string }>;
 
     expect(unordered[0]).toEqual({
       reference:
-        "examples/Planning team workshops for the next quarter",
+        "websim/I- Prompt arenas into existence to create a market for model capabilities",
       label:
-        "Planning team workshops for the next quarter",
-      directory: "examples/",
+        "I- Prompt arenas into existence to create a market for model capabilities",
+      directory: "websim/",
     });
     expect(mistyped[0]).toEqual(unordered[0]);
     expect(listCalls).toBe(1);
@@ -727,10 +925,58 @@ describe("wikilinks server", () => {
         /^sonner$/,
         /^@tiptap\//,
         /^tiptap-markdown$/,
+        /^diff$/,
         /^@testing-library\/react$/,
       ],
     });
     expect(scan.violations).toEqual([]);
     expect(scan.privateDependencies).toEqual([]);
+  });
+});
+
+describe("opening missing notes", () => {
+  const input = { path: "nested/New note.md", source: { kind: "workspace", environmentId: "env-1", threadId: "thread-1", projectId: "project-1" } };
+  async function setup({ exists = false, race = false, failProbe = false } = {}) {
+    let content: string | null = exists ? "Existing text" : null;
+    const writes: unknown[] = [];
+    const { bb, harness } = createFakePluginHost({ pluginId: "wikilinks", sdk: {
+      environments: { get: async () => ({ path: "/workspace", hostId: "host-1" }) as never },
+      hosts: { pathsExist: async () => {
+        if (failProbe) throw new Error("Host offline");
+        return { existence: { "/workspace/nested/New note.md": exists } };
+      } },
+      files: {
+        read: async () => {
+          if (content === null || exists) throw new Error(exists ? "Permission denied" : "File missing");
+          return { content, contentEncoding: "utf8", sha256: "sha", sizeBytes: content.length } as never;
+        },
+        write: async args => {
+          writes.push(args);
+          content = race ? "Created by another client" : "";
+          return race ? { outcome: "conflict", currentSha256: "sha" } as never : { outcome: "written", sha256: "sha" } as never;
+        },
+      },
+    } });
+    await plugin(bb);
+    return { harness, writes };
+  }
+  it("creates only on an explicit open, with an atomic create-only write", async () => {
+    const { harness, writes } = await setup();
+    await expect(harness.behavior.callRpc("open_markdown", input)).rejects.toThrow();
+    expect(writes).toEqual([]);
+    await expect(harness.behavior.callRpc("open_markdown", { ...input, createIfMissing: true })).resolves.toEqual({ content: "", sha256: "sha", created: true });
+    expect(writes).toEqual([{ hostId: "host-1", path: "/workspace/nested/New note.md", rootPath: "/workspace", content: "", contentEncoding: "utf8", createParents: true, expectedSha256: null }]);
+    await harness.lifecycle.dispose();
+  });
+  it("preserves a note created by another client during the open", async () => {
+    const { harness } = await setup({ race: true });
+    await expect(harness.behavior.callRpc("open_markdown", { ...input, createIfMissing: true })).resolves.toEqual({ content: "Created by another client", sha256: "sha" });
+    await harness.lifecycle.dispose();
+  });
+  it.each([{ exists: true }, { failProbe: true }])("does not turn read or connection errors into writes: %j", async options => {
+    const { harness, writes } = await setup(options);
+    await expect(harness.behavior.callRpc("open_markdown", { ...input, createIfMissing: true })).rejects.toThrow();
+    expect(writes).toEqual([]);
+    await harness.lifecycle.dispose();
   });
 });

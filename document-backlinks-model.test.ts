@@ -13,16 +13,16 @@ import {
   type VaultGraphBacklink,
 } from "./document-backlinks-model.js";
 
-const host = { kind: "host" as const, hostId: "host_1", path: "/vault/Team handbook.md" };
+const host = { kind: "host" as const, hostId: "host_1", path: "/vault/Agent society.md" };
 
 function backlink(overrides: Partial<VaultGraphBacklink>): VaultGraphBacklink {
   return {
     sourceKind: "note",
-    sourceTitle: "Team handbook",
-    sourcePath: "Team handbook.md",
+    sourceTitle: "Agent society",
+    sourcePath: "Agent society.md",
     threadId: null,
     heading: null,
-    context: "Needs [[Project planning|differences]].",
+    context: "Needs [[Structured entropy|differences]].",
     line: 20,
     linkKind: "wikilink",
     target: host,
@@ -33,26 +33,26 @@ function backlink(overrides: Partial<VaultGraphBacklink>): VaultGraphBacklink {
 describe("groupVaultGraphBacklinks", () => {
   it("groups occurrences by source and keeps threads without context", () => {
     const data = groupVaultGraphBacklinks({
-      title: "Project planning",
+      title: "Structured entropy",
       backlinks: [
-        backlink({ heading: "Team handbook", line: 20 }),
+        backlink({ heading: "Agent society", line: 20 }),
         backlink({
-          heading: "Team handbook > Why it matters",
+          heading: "Agent society > Why it matters",
           line: 31,
-          context: "Also [[Project planning]] again.",
+          context: "Also [[Structured entropy]] again.",
         }),
         backlink({
           sourceKind: "canvas",
           sourceTitle: "Ideas board",
           sourcePath: "Ideas board.tldraw",
           heading: "Ideas board > Sticky",
-          context: "[[Project planning]] as a planning reference",
+          context: "[[Structured entropy]] as a mutation source",
           line: null,
           target: { kind: "host", hostId: "host_1", path: "/vault/Ideas board.tldraw" },
         }),
         backlink({
           sourceKind: "thread",
-          sourceTitle: "team discussion",
+          sourceTitle: "agent societies",
           sourcePath: null,
           threadId: "thr_1",
           heading: null,
@@ -63,27 +63,27 @@ describe("groupVaultGraphBacklinks", () => {
       ],
       unlinked: [
         {
-          sourceTitle: "Meeting notes",
-          sourcePath: "Meeting notes.md",
-          snippet: "project planning without a link",
-          target: { kind: "host", hostId: "host_1", path: "/vault/Meeting notes.md" },
+          sourceTitle: "Novelty search",
+          sourcePath: "Novelty search.md",
+          snippet: "structured entropy without a link",
+          target: { kind: "host", hostId: "host_1", path: "/vault/Novelty search.md" },
         },
       ],
     });
     expect(data.provider).toBe("vault-graph");
     expect(data.linked.map((group) => [group.kind, group.title, group.occurrences.length])).toEqual([
-      ["note", "Team handbook", 2],
+      ["note", "Agent society", 2],
       ["canvas", "Ideas board", 1],
-      ["thread", "team discussion", 0],
+      ["thread", "agent societies", 0],
     ]);
     expect(data.linked[0]!.occurrences[1]).toEqual({
-      headings: ["Team handbook", "Why it matters"],
-      context: "Also [[Project planning]] again.",
+      headings: ["Agent society", "Why it matters"],
+      context: "Also [[Structured entropy]] again.",
       line: 31,
     });
     expect(data.linked[2]).toMatchObject({ threadId: "thr_1", target: null });
     expect(data.unlinked).toHaveLength(1);
-    expect(data.unlinked[0]!.occurrences[0]!.context).toBe("project planning without a link");
+    expect(data.unlinked[0]!.occurrences[0]!.context).toBe("structured entropy without a link");
   });
 
   it("drops duplicate occurrences of the same block", () => {
@@ -124,20 +124,20 @@ describe("groupPreviewBacklinks", () => {
 describe("highlightContext", () => {
   it("marks only the wikilinks that point at this note", () => {
     const parts = highlightContext(
-      "See [[Project planning|differences]], [[Other]] and [[folder/Project planning#Heading]].",
-      "Project planning",
+      "See [[Structured entropy|differences]], [[Other]] and [[folder/Structured entropy#Heading]].",
+      "Structured entropy",
     );
     expect(parts.filter((part) => part.hit).map((part) => part.text)).toEqual([
-      "[[Project planning|differences]]",
-      "[[folder/Project planning#Heading]]",
+      "[[Structured entropy|differences]]",
+      "[[folder/Structured entropy#Heading]]",
     ]);
     expect(parts.map((part) => part.text).join("")).toBe(
-      "See [[Project planning|differences]], [[Other]] and [[folder/Project planning#Heading]].",
+      "See [[Structured entropy|differences]], [[Other]] and [[folder/Structured entropy#Heading]].",
     );
   });
 
   it("is case-insensitive and tolerates .md suffixes", () => {
-    expect(highlightContext("[[project PLANNING.md]]", "Project planning")[0]!.hit).toBe(true);
+    expect(highlightContext("[[structured ENTROPY.md]]", "Structured entropy")[0]!.hit).toBe(true);
     expect(highlightContext("plain text", "X")).toEqual([
       { text: "plain text", label: "plain text", link: false, hit: false },
     ]);
@@ -171,7 +171,7 @@ describe("target helpers", () => {
   });
 
   it("derives the note title from the path", () => {
-    expect(noteTitleFromPath("notes/Project%20planning.md")).toBe("Project planning");
+    expect(noteTitleFromPath("notes/Structured%20entropy.md")).toBe("Structured entropy");
     expect(splitHeadingBreadcrumb("A > B > C")).toEqual(["A", "B", "C"]);
     expect(splitHeadingBreadcrumb(null)).toEqual([]);
   });

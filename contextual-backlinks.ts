@@ -23,7 +23,30 @@ function compareCandidates(left: string, right: string): number {
   );
 }
 
-export function createWikilinkPathResolver(paths: readonly string[]) {
+export type WikilinkPathResolver = (
+  reference: string,
+  currentPath: string,
+) => string | null;
+
+const resolverCache = new WeakMap<readonly string[], WikilinkPathResolver>();
+
+/**
+ * Building a resolver indexes every path in the vault, which is far too much
+ * work to repeat for each hover, so it is memoized against the path list.
+ */
+export function cachedWikilinkPathResolver(
+  paths: readonly string[],
+): WikilinkPathResolver {
+  const cached = resolverCache.get(paths);
+  if (cached) return cached;
+  const resolver = createWikilinkPathResolver(paths);
+  resolverCache.set(paths, resolver);
+  return resolver;
+}
+
+export function createWikilinkPathResolver(
+  paths: readonly string[],
+): WikilinkPathResolver {
   const normalizedPaths = paths.map((candidate) => candidate.replace(/\\/g, "/"));
   const exact = new Map(
     normalizedPaths.map((candidate) => [normalizedCandidate(candidate), candidate]),

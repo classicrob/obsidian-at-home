@@ -52,8 +52,15 @@ import {
 } from "./hover-preview.js";
 import { elementRect, type HoverAnchorRect } from "./hover-types.js";
 import { InstantMarkdownPreview } from "./instant-markdown-preview.js";
-import { displayWikilinkLabel } from "./wikilink-markdown.js";
+import { displayWikilinkLabel, parseWikilinkSubpath } from "./wikilink-markdown.js";
 import { parseMarkdownDocument } from "./markdown-document.js";
+import { mergeThreeWay } from "./three-way-merge.js";
+import {
+  clearEditorDraft,
+  planDraftRestore,
+  readEditorDraft,
+  writeEditorDraft,
+} from "./editor-draft.js";
 import {
   ThinkingTrailParent,
   ThinkingTrailProvider,
@@ -566,6 +573,7 @@ function PreviewingFileLink({
           title={title}
           preview={preview}
           loading={loading}
+          focus={parseWikilinkSubpath(reference)}
           onOpen={() => {
             markClickThrough();
             navigate.experimental_openFilePreview({ target, location: null });
@@ -600,7 +608,7 @@ interface EditorHoverState {
   anchor: HoverAnchorRect;
   preview: HoverPreviewData | null;
   loading: boolean;
-  target: ExperimentalLiveFileTarget;
+  target: ExperimentalLiveFileTarget | null;
 }
 
 function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
@@ -634,6 +642,11 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
   );
   const activeFileRoot = useRef<HTMLDivElement>(null);
   useAnnounceActiveFile("wikilinks", path, openerSource, activeFileRoot);
+  // Identifies this note's editor to the shared composer autocomplete script.
+  const editorBridgeId = useId();
+  // Targets for references that are not (yet) links in this document, such as
+  // autocomplete suggestions the user previewed or opened.
+  const externalTargets = useRef(new Map<string, ExperimentalLiveFileTarget>());
   const initiallyCached = markdownFileCache.get(cacheKey);
   const [result, setResult] = useState<Awaited<
     ReturnType<typeof rpc.call<"open_markdown">>
@@ -645,6 +658,7 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
   const [reloadNonce, setReloadNonce] = useState(0);
   const [conflict, setConflict] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [refreshFailed, setRefreshFailed] = useState(false);
   const [saveStatus, setSaveStatus] = useState<
     "saved" | "unsaved" | "saving"
   >("saved");
@@ -653,10 +667,19 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
       () => loadedLiveMarkdownEditor,
     );
   const [editRequested, setEditRequested] = useState(false);
-  const [editorReady, setEditorReady] = useState(false);
+  // Readiness is tracked per editor instance (its React key) so a load
+  // effect running after a fresh editor mounts cannot strand it "preparing".
+  const editorKey = `${path}:${reloadNonce}`;
+  const [readyEditorKey, setReadyEditorKey] = useState<string | null>(null);
+  const editorReady = readyEditorKey === editorKey;
   const [focusRequest, setFocusRequest] = useState<{
     left: number;
     top: number;
+    sequence: number;
+  } | null>(null);
+  const [selectionRequest, setSelectionRequest] = useState<{
+    from: number;
+    to: number;
     sequence: number;
   } | null>(null);
   const [hover, setHover] = useState<EditorHoverState | null>(null);
@@ -669,7 +692,11 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
   const queuedSaveRef = useRef(false);
   const conflictRef = useRef(false);
   const fileReadSequence = useRef(0);
+  const openingRef = useRef(false);
   const saveRef = useRef<(force?: boolean) => Promise<void>>(async () => {});
+  const selectionRef = useRef<{ from: number; to: number } | null>(null);
+  const draftTimer = useRef<number | null>(null);
+  const conflictRetriesRef = useRef(0);
   const hoverCache = useRef(new Map<string, HoverPreviewData>());
   const hoverOpenTimer = useRef<number | null>(null);
   const hoverCloseTimer = useRef<number | null>(null);
@@ -680,9 +707,94 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
     null,
   );
 
+  const scheduleSave = useCallback(() => {
+    if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
+    setSaveStatus("unsaved");
+    saveTimer.current = window.setTimeout(() => {
+      saveTimer.current = null;
+      void saveRef.current();
+    }, 650);
+  }, []);
+
+  // Unsaved text is parked per note so a plugin bundle reload, which remounts
+  // this view, can hand it back instead of dropping it.
+  const writeDraftNow = useCallback(() => {
+    if (draftTimer.current !== null) window.clearTimeout(draftTimer.current);
+    draftTimer.current = null;
+    if (markdownRef.current === savedRef.current) {
+      clearEditorDraft(cacheKey);
+      return;
+    }
+    writeEditorDraft(cacheKey, {
+      baseSha: shaRef.current,
+      base: savedRef.current,
+      markdown: markdownRef.current,
+      editing: true,
+      selection: selectionRef.current,
+      at: Date.now(),
+    });
+  }, [cacheKey]);
+  const scheduleDraftWrite = useCallback(() => {
+    if (draftTimer.current !== null) window.clearTimeout(draftTimer.current);
+    draftTimer.current = window.setTimeout(writeDraftNow, 100);
+  }, [writeDraftNow]);
+
+  /**
+   * Takes a newer copy of the file into the view. With no local edits it
+   * simply replaces the content; with unsaved edits it merges them on top of
+   * the new file line by line and saves the result, only falling back to the
+   * conflict banner when both sides changed the same lines.
+   */
+  const adoptExternalChange = useCallback(
+    (next: { content: string; sha256: string }): boolean => {
+      const base = savedRef.current;
+      const ours = markdownRef.current;
+      setFailed(false);
+      setSaveError(null);
+      setLinks([]);
+      if (ours === base) {
+        markdownRef.current = next.content;
+        savedRef.current = next.content;
+        shaRef.current = next.sha256;
+        setSaveStatus("saved");
+        cacheMarkdownFile(cacheKey, { result: next, links: [] });
+        setResult({ content: next.content, sha256: next.sha256 });
+        clearEditorDraft(cacheKey);
+        return true;
+      }
+      const merge = mergeThreeWay(base, ours, next.content);
+      if (!merge.ok) {
+        conflictRef.current = true;
+        setConflict(true);
+        setSaveStatus("unsaved");
+        return false;
+      }
+      savedRef.current = next.content;
+      shaRef.current = next.sha256;
+      markdownRef.current = merge.merged;
+      cacheMarkdownFile(cacheKey, {
+        result: { content: next.content, sha256: next.sha256 },
+        links: [],
+      });
+      setResult({ content: merge.merged, sha256: next.sha256 });
+      if (merge.merged === next.content) {
+        setSaveStatus("saved");
+        clearEditorDraft(cacheKey);
+      } else {
+        scheduleSave();
+        writeDraftNow();
+      }
+      return true;
+    },
+    [cacheKey, scheduleSave, writeDraftNow],
+  );
+  const adoptExternalRef = useRef(adoptExternalChange);
+  adoptExternalRef.current = adoptExternalChange;
+
   useEffect(() => {
     let active = true;
     const requestSequence = ++fileReadSequence.current;
+    openingRef.current = true;
     const cached = markdownFileCache.get(cacheKey);
     setResult(cached?.result ?? null);
     setLinks(cached?.links ?? []);
@@ -690,43 +802,77 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
     setConflict(false);
     conflictRef.current = false;
     setSaveError(null);
+    setRefreshFailed(false);
     setSaveStatus("saved");
     setEditRequested(false);
-    setEditorReady(false);
     setFocusRequest(null);
-    if (cached) {
-      markdownRef.current = cached.result.content;
-      savedRef.current = cached.result.content;
-      shaRef.current = cached.result.sha256;
-    }
-    rpc.call("open_markdown", { path, source: openerSource }).then(
+    setSelectionRequest(null);
+    conflictRetriesRef.current = 0;
+    markdownRef.current = cached?.result.content ?? "";
+    savedRef.current = cached?.result.content ?? "";
+    shaRef.current = cached?.result.sha256 ?? null;
+    rpc.call("open_markdown", { path, source: openerSource, createIfMissing: true }).then(
       (next) => {
         if (!active || requestSequence !== fileReadSequence.current) return;
+        openingRef.current = false;
         if (shaRef.current && shaRef.current !== next.sha256) {
           setEditRequested(false);
-          setEditorReady(false);
         }
-        markdownRef.current = next.content;
         savedRef.current = next.content;
         shaRef.current = next.sha256;
         cacheMarkdownFile(cacheKey, {
           result: next,
           links: cached?.links ?? [],
         });
-        setResult(next);
+        // A draft left by a previous mount (the plugin bundle was reloaded
+        // mid-edit) comes back as unsaved text, merged if the file moved on.
+        const draft = readEditorDraft(cacheKey);
+        const plan = draft
+          ? planDraftRestore(draft, next)
+          : ({ kind: "none" } as const);
+        if (plan.kind === "none") {
+          if (draft) clearEditorDraft(cacheKey);
+          markdownRef.current = next.content;
+          setResult(next);
+          if (next.created) {
+            setEditRequested(true);
+            setFocusRequest({ left: 0, top: 0, sequence: Date.now() });
+          }
+          return;
+        }
+        setEditRequested(true);
+        if (draft?.selection) {
+          setSelectionRequest({ ...draft.selection, sequence: Date.now() });
+        }
+        if (plan.kind === "conflict") {
+          markdownRef.current = draft!.markdown;
+          conflictRef.current = true;
+          setConflict(true);
+          setSaveStatus("unsaved");
+          setResult({ content: draft!.markdown, sha256: next.sha256 });
+          return;
+        }
+        markdownRef.current = plan.markdown;
+        setResult({ content: plan.markdown, sha256: next.sha256 });
+        scheduleSave();
+        writeDraftNow();
       },
       () => {
-        if (active) setFailed(true);
+        if (active && requestSequence === fileReadSequence.current) {
+          openingRef.current = false;
+          setFailed(true);
+        }
       },
     );
     return () => {
       active = false;
     };
-  }, [cacheKey, openerSource, path, reloadNonce, rpc]);
+  }, [cacheKey, openerSource, path, reloadNonce, rpc, scheduleSave, writeDraftNow]);
 
   useEffect(() => {
     let active = true;
     let timer: number | null = null;
+    let inFlight = false;
 
     const schedule = (delay = LIVE_MARKDOWN_REFRESH_MS) => {
       if (!active) return;
@@ -736,12 +882,14 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
 
     const refresh = async () => {
       timer = null;
+      if (!active || inFlight) return;
       const knownSha256 = shaRef.current;
-      const locallyChanged = markdownRef.current !== savedRef.current;
+      // Local edits do not pause the poll: an external change is merged on
+      // top of them so it still shows up right away.
       if (
         document.visibilityState === "hidden" ||
+        openingRef.current ||
         !knownSha256 ||
-        locallyChanged ||
         savingRef.current ||
         conflictRef.current
       ) {
@@ -750,6 +898,7 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
       }
 
       const requestSequence = ++fileReadSequence.current;
+      inFlight = true;
       try {
         const next = await rpc.call("refresh_markdown", {
           path,
@@ -759,41 +908,28 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
         if (
           !active ||
           requestSequence !== fileReadSequence.current ||
-          !next.changed ||
           shaRef.current !== knownSha256
         ) {
           return;
         }
-        if (
-          markdownRef.current !== savedRef.current ||
-          savingRef.current ||
-          conflictRef.current
-        ) {
-          conflictRef.current = true;
-          setConflict(true);
-          setSaveStatus("unsaved");
-          return;
-        }
-
-        const refreshed = { content: next.content, sha256: next.sha256 };
-        markdownRef.current = next.content;
-        savedRef.current = next.content;
-        shaRef.current = next.sha256;
-        setFailed(false);
-        setSaveError(null);
-        setSaveStatus("saved");
-        setLinks([]);
-        cacheMarkdownFile(cacheKey, { result: refreshed, links: [] });
-        setResult(refreshed);
+        setRefreshFailed(false);
+        if (!next.changed) return;
+        // A save that started meanwhile will see this change as a conflict
+        // and reconcile it itself.
+        if (savingRef.current || conflictRef.current) return;
+        adoptExternalRef.current({ content: next.content, sha256: next.sha256 });
       } catch {
-        // Transient host or plugin reload failures are retried by the next check.
+        if (active && requestSequence === fileReadSequence.current) {
+          setRefreshFailed(true);
+        }
       } finally {
+        inFlight = false;
         schedule();
       }
     };
 
     const refreshNow = () => {
-      if (document.visibilityState !== "hidden") schedule(0);
+      if (!inFlight && document.visibilityState !== "hidden") schedule(0);
     };
 
     schedule();
@@ -805,7 +941,7 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
       document.removeEventListener("visibilitychange", refreshNow);
       window.removeEventListener("focus", refreshNow);
     };
-  }, [cacheKey, openerSource, path, rpc]);
+  }, [cacheKey, openerSource, path, reloadNonce, rpc]);
 
   const resolveLinksForContent = useCallback(
     (content: string) => {
@@ -882,25 +1018,50 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
             : {}),
         });
         if (saved.outcome === "conflict") {
+          // The file moved on under us. Fetch it and merge our text on top
+          // rather than blocking on the banner; the merged text saves next.
+          const knownSha256 = shaRef.current;
+          if (knownSha256 && conflictRetriesRef.current < 3) {
+            conflictRetriesRef.current += 1;
+            const latest = await rpc.call("refresh_markdown", {
+              path,
+              source: openerSource,
+              knownSha256,
+            });
+            if (shaRef.current !== knownSha256 || conflictRef.current) return;
+            if (latest.changed) {
+              if (adoptExternalRef.current(latest)) queuedSaveRef.current = false;
+              return;
+            }
+            // Our sha already matches the file: retry the save once more.
+            queuedSaveRef.current = true;
+            return;
+          }
           conflictRef.current = true;
           setConflict(true);
           setSaveStatus("unsaved");
           return;
         }
+        conflictRetriesRef.current = 0;
         savedRef.current = content;
         shaRef.current = saved.sha256;
         conflictRef.current = false;
         setConflict(false);
+        // Echo back what the editor shows now, not the snapshot that was
+        // saved; keystrokes typed during the save must not be rolled back.
         setResult((current) => {
           const next = current
-            ? { content, sha256: saved.sha256 }
+            ? { content: markdownRef.current, sha256: saved.sha256 }
             : current;
           if (next) cacheMarkdownFile(cacheKey, { result: next, links });
           return next;
         });
-        setSaveStatus(
-          markdownRef.current === content ? "saved" : "unsaved",
-        );
+        if (markdownRef.current === content) {
+          setSaveStatus("saved");
+          clearEditorDraft(cacheKey);
+        } else {
+          setSaveStatus("unsaved");
+        }
         setBacklinksRefresh((value) => value + 1);
       } catch (error) {
         setSaveError(error instanceof Error ? error.message : String(error));
@@ -916,19 +1077,15 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
     [cacheKey, links, openerSource, path, resolveLinksForContent, rpc],
   );
   saveRef.current = save;
-
-  const scheduleSave = useCallback(() => {
-    if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
-    setSaveStatus("unsaved");
-    saveTimer.current = window.setTimeout(() => {
-      saveTimer.current = null;
-      void saveRef.current();
-    }, 650);
-  }, []);
+  const writeDraftRef = useRef(writeDraftNow);
+  writeDraftRef.current = writeDraftNow;
 
   useEffect(
     () => () => {
       if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
+      // Park unsaved text first: the save below may not complete if this
+      // unmount is the plugin bundle being reloaded.
+      writeDraftRef.current();
       void saveRef.current();
     },
     [],
@@ -1093,9 +1250,31 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
 
   const openReference = useCallback(
     (reference: string) => {
-      const link = linkIndex.get(reference);
-      if (!link) {
-        toast.error("That note link has not resolved yet.");
+      const target =
+        linkIndex.get(reference)?.target ??
+        externalTargets.current.get(reference) ??
+        null;
+      if (!target) {
+        // Not a link in this document yet (for example a suggestion picked
+        // from autocomplete); resolve it against the note's workspace.
+        void rpc
+          .call("resolve_chat_wikilink", {
+            source: openerSource,
+            path,
+            reference,
+          })
+          .then(({ target: resolved }) => {
+            if (!resolved) {
+              toast.error("That note link has not resolved yet.");
+              return;
+            }
+            externalTargets.current.set(reference, resolved);
+            navigate.experimental_openFilePreview({
+              target: resolved,
+              location: null,
+            });
+          })
+          .catch(() => toast.error("Could not resolve that note link."));
         return;
       }
       if (
@@ -1107,7 +1286,7 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
       } else {
         const localId = trail?.beginVisit({
           label: displayWikilinkLabel(reference, undefined),
-          target: link.target,
+          target,
           relation: "link",
           previewMode: "note",
           parentLocalId: trailParent,
@@ -1117,12 +1296,9 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
           trail?.finish("context-changed");
         }
       }
-      navigate.experimental_openFilePreview({
-        target: link.target,
-        location: null,
-      });
+      navigate.experimental_openFilePreview({ target, location: null });
     },
-    [linkIndex, navigate, trail, trailParent],
+    [linkIndex, navigate, openerSource, path, rpc, trail, trailParent],
   );
   const hoverLinkIndex = useMemo(
     () => new Map((hover?.preview?.links ?? []).map((link) => [link.reference, link])),
@@ -1162,6 +1338,170 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
     },
     [linkIndex],
   );
+  // Wikilinks typed inside this note: the composer autocomplete content script
+  // sends queries, suggestion hovers and open requests tagged with this
+  // editor's bridge id, mirroring what the chat bridge does for the composer.
+  useEffect(() => {
+    const bridgeId = editorBridgeId;
+    const onQuery = (event: Event) => {
+      if (!(event instanceof CustomEvent)) return;
+      const detail = event.detail as Partial<ComposerWikilinkQueryDetail> | null;
+      if (
+        detail?.bridgeId !== bridgeId ||
+        typeof detail.requestId !== "number" ||
+        typeof detail.query !== "string"
+      ) {
+        return;
+      }
+      const requestId = detail.requestId;
+      const respond = (
+        suggestions: ComposerWikilinkResultsDetail["suggestions"],
+      ) => {
+        window.dispatchEvent(
+          new CustomEvent<ComposerWikilinkResultsDetail>(
+            COMPOSER_WIKILINK_RESULTS_EVENT,
+            { detail: { bridgeId, requestId, suggestions } },
+          ),
+        );
+      };
+      void rpc
+        .call("autocomplete_wikilinks", {
+          source: openerSource,
+          path,
+          query: detail.query,
+        })
+        .then(respond, () => respond([]));
+    };
+    const onHover = (event: Event) => {
+      if (!(event instanceof CustomEvent)) return;
+      const detail = event.detail as Partial<ChatWikilinkHoverDetail> | null;
+      const anchor = detail?.anchor;
+      if (
+        detail?.bridgeId !== bridgeId ||
+        typeof detail.reference !== "string" ||
+        detail.reference.trim() === "" ||
+        !anchor ||
+        detail.web
+      ) {
+        return;
+      }
+      const reference = detail.reference;
+      const showBacklinks = detail.backlinks === true;
+      clearHoverOpen();
+      clearHoverClose();
+      hoverOpenTimer.current = window.setTimeout(
+        () => {
+          endEditorTrailVisit();
+          const cacheKey = `${showBacklinks ? "backlinks" : "note"}\0${reference}`;
+          const knownTarget = externalTargets.current.get(reference) ?? null;
+          const cached = hoverCache.current.get(cacheKey);
+          if (cached) {
+            setHover({
+              reference,
+              anchor,
+              preview: cached,
+              loading: false,
+              target: knownTarget,
+            });
+            return;
+          }
+          setHover({
+            reference,
+            anchor,
+            preview: null,
+            loading: true,
+            target: knownTarget,
+          });
+          const sequence = ++hoverSequence.current;
+          void rpc
+            .call("preview_chat_wikilink", {
+              source: openerSource,
+              path,
+              reference,
+              backlinks: showBacklinks,
+            })
+            .then(
+              (result) => {
+                if (result.target) {
+                  externalTargets.current.set(reference, result.target);
+                }
+                const preview = {
+                  content: result.content,
+                  imageDataUrl: result.imageDataUrl,
+                  backlinks: result.backlinks,
+                  truncated: result.truncated,
+                  links: result.links,
+                };
+                hoverCache.current.set(cacheKey, preview);
+                if (hoverSequence.current !== sequence) return;
+                setHover({
+                  reference,
+                  anchor,
+                  preview,
+                  loading: false,
+                  target: result.target,
+                });
+              },
+              () => {
+                if (hoverSequence.current !== sequence) return;
+                setHover({
+                  reference,
+                  anchor,
+                  preview: {
+                    content: null,
+                    imageDataUrl: null,
+                    backlinks: showBacklinks ? [] : null,
+                    truncated: false,
+                    links: [],
+                  },
+                  loading: false,
+                  target: knownTarget,
+                });
+              },
+            );
+        },
+        detail.immediate ? 0 : HOVER_OPEN_DELAY_MS,
+      );
+    };
+    const onLeave = (event: Event) => {
+      if (!(event instanceof CustomEvent)) return;
+      const detail = event.detail as Partial<ChatWikilinkOpenDetail> | null;
+      if (detail?.bridgeId === bridgeId) hideHover();
+    };
+    const onOpen = (event: Event) => {
+      if (!(event instanceof CustomEvent)) return;
+      const detail = event.detail as Partial<ChatWikilinkOpenDetail> | null;
+      if (
+        detail?.bridgeId !== bridgeId ||
+        typeof detail.reference !== "string" ||
+        detail.reference.trim() === ""
+      ) {
+        return;
+      }
+      openReference(detail.reference);
+    };
+    window.addEventListener(COMPOSER_WIKILINK_QUERY_EVENT, onQuery);
+    window.addEventListener(CHAT_WIKILINK_HOVER_EVENT, onHover);
+    window.addEventListener(CHAT_WIKILINK_LEAVE_EVENT, onLeave);
+    window.addEventListener(CHAT_WIKILINK_OPEN_EVENT, onOpen);
+    return () => {
+      window.removeEventListener(COMPOSER_WIKILINK_QUERY_EVENT, onQuery);
+      window.removeEventListener(CHAT_WIKILINK_HOVER_EVENT, onHover);
+      window.removeEventListener(CHAT_WIKILINK_LEAVE_EVENT, onLeave);
+      window.removeEventListener(CHAT_WIKILINK_OPEN_EVENT, onOpen);
+    };
+  }, [
+    clearHoverClose,
+    clearHoverOpen,
+    editorBridgeId,
+    endEditorTrailVisit,
+    hideHover,
+    openReference,
+    openerSource,
+    path,
+    rpc,
+  ]);
+
   const requestEdit = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
     if (
       event.target instanceof Element &&
@@ -1203,10 +1543,21 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
                   : "Saved"}
         </span>
       </div>
+      {refreshFailed ? (
+        <div className="wikilinks-editor-alert" role="status">
+          Live updates interrupted. Retrying…
+        </div>
+      ) : null}
       {conflict ? (
         <div className="wikilinks-editor-alert" role="alert">
           <span>This note changed on disk.</span>
-          <button type="button" onClick={() => setReloadNonce((value) => value + 1)}>
+          <button
+            type="button"
+            onClick={() => {
+              clearEditorDraft(cacheKey);
+              setReloadNonce((value) => value + 1);
+            }}
+          >
             Reload
           </button>
           <button type="button" onClick={() => void save(true)}>
@@ -1245,15 +1596,19 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
           {LiveMarkdownEditor ? (
             <div className="wikilinks-editor-layer" hidden={!editing}>
               <LiveMarkdownEditor
-                key={`${path}:${result.sha256}:${reloadNonce}`}
+                key={editorKey}
+                bridgeId={editorBridgeId}
                 initialValue={result.content}
                 active={editing}
                 focusRequest={focusRequest}
-                onReady={() => setEditorReady(true)}
+                selectionRequest={selectionRequest}
+                onReady={() => setReadyEditorKey(editorKey)}
                 onFirstRender={() => undefined}
-                onMarkdownChange={(markdown) => {
+                onMarkdownChange={(markdown, selection) => {
                   markdownRef.current = markdown;
+                  selectionRef.current = selection;
                   scheduleSave();
+                  scheduleDraftWrite();
                 }}
                 onReferenceOpen={(reference) => openReference(reference)}
                 onReferenceHover={showHover}
@@ -1279,6 +1634,7 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
           title={hover ? displayWikilinkLabel(hover.reference, undefined) : "Note"}
           preview={hover?.preview ?? null}
           loading={hover?.loading ?? false}
+          focus={hover ? parseWikilinkSubpath(hover.reference) : null}
           onOpen={hover ? () => openReference(hover.reference) : undefined}
           onInteract={() => {
             if (editorVisitRef.current) trail?.interact(editorVisitRef.current);
@@ -1745,6 +2101,7 @@ function ChatWikilinkBridge({ threadId }: { threadId: string }) {
           }
           preview={hover?.preview ?? null}
           loading={hover?.loading ?? false}
+          focus={hover ? parseWikilinkSubpath(hover.reference) : null}
           onOpen={
             hover?.target
               ? () => {

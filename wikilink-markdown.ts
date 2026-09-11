@@ -49,7 +49,81 @@ interface MarkdownNode {
   type: string;
   value?: string;
   url?: string;
+  depth?: number;
   children?: MarkdownNode[];
+  data?: { hProperties?: Record<string, unknown>; [key: string]: unknown };
+}
+
+/** The `#heading` or `#^block` part of a wikilink reference, if any. */
+export type WikilinkSubpath =
+  | { kind: "block"; id: string }
+  | { kind: "heading"; text: string };
+
+export function normalizeHeadingText(value: string): string {
+  return value
+    .replace(/[*_`~[\]]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLocaleLowerCase();
+}
+
+export function parseWikilinkSubpath(reference: string): WikilinkSubpath | null {
+  const withoutAlias = reference.split("|", 1)[0]!;
+  const hashIndex = withoutAlias.indexOf("#");
+  if (hashIndex === -1) return null;
+  // Obsidian allows nested headings (`Note#A#B`); the last part is the target.
+  const subpath = withoutAlias.slice(hashIndex + 1).split("#").at(-1)!.trim();
+  if (subpath === "") return null;
+  if (subpath.startsWith("^")) {
+    const id = subpath.slice(1).trim();
+    return id === "" ? null : { kind: "block", id };
+  }
+  return { kind: "heading", text: normalizeHeadingText(subpath) };
+}
+
+const BLOCK_ID_SUFFIX = /(?:^|\s)\^([A-Za-z0-9-]+)\s*$/;
+
+function setHProperty(node: MarkdownNode, key: string, value: string): void {
+  const data = node.data ?? (node.data = {});
+  const properties = data.hProperties ?? (data.hProperties = {});
+  properties[key] = value;
+}
+
+function plainText(node: MarkdownNode): string {
+  if (typeof node.value === "string" && node.type !== "html") return node.value;
+  return (node.children ?? []).map(plainText).join("");
+}
+
+/**
+ * Obsidian block anchors (`… ^abc123` at the end of a block) become a
+ * `data-block-id` on the rendered element and the marker text is hidden, so
+ * a hover preview can scroll to `[[Note#^abc123]]`. Headings get a
+ * `data-heading` with their normalized text for `[[Note#Heading]]`.
+ */
+function annotateBlockAnchors(node: MarkdownNode, parent: MarkdownNode | null): void {
+  if (node.type === "heading") {
+    setHProperty(node, "data-heading", normalizeHeadingText(plainText(node)));
+  }
+  if (node.type === "paragraph" || node.type === "heading" || node.type === "tableCell") {
+    const last = node.children?.at(-1);
+    if (last && last.type === "text" && typeof last.value === "string") {
+      const match = BLOCK_ID_SUFFIX.exec(last.value);
+      if (match) {
+        last.value = last.value.slice(0, match.index).replace(/\s+$/, "");
+        if (last.value === "") node.children!.pop();
+        const owner =
+          parent && (parent.type === "listItem" || parent.type === "tableRow") ? parent : node;
+        setHProperty(owner, "data-block-id", match[1]!);
+      }
+    }
+  }
+  for (const child of node.children ?? []) annotateBlockAnchors(child, node);
+}
+
+export function remarkBlockAnchors() {
+  return (tree: MarkdownNode) => {
+    annotateBlockAnchors(tree, null);
+  };
 }
 
 export function displayWikilinkLabel(

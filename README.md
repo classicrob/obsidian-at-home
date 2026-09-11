@@ -39,8 +39,11 @@ check.
 
 YAML frontmatter is shown as document properties and preserved byte-for-byte
 when the body is edited. Saves use the file's SHA-256 as a compare-and-swap
-guard. If an agent or another app changes the note first, the editor pauses and
-offers **Reload** or an explicit **Overwrite** instead of silently losing work.
+guard. Changes from agents or other apps merge automatically when they affect
+different lines from your unsaved edits. Overlapping edits pause saving and
+offer **Reload** or an explicit **Overwrite**. Unsaved drafts, editing mode, and
+the caret are retained in session storage across editor remounts; a restored
+draft is merged with any newer file content before editing resumes.
 Wikilink syntax collapses to its readable label while idle and reappears when
 the caret enters it.
 
@@ -52,7 +55,9 @@ the pointer is over it, and includes an **Open note** action for semantic zoom
 into the full file. Wikilinks inside hover previews are interactive too, so
 hovering them opens another rendered excerpt in a recursive preview cascade.
 Wikilinks ending in `.tldraw` use the canvas file's embedded static thumbnail,
-scaled to fit the hover card without loading an interactive canvas.
+scaled to fit the hover card without loading an interactive canvas. Note previews
+contain the full note body and scroll to and highlight `#Heading` or `#^block-id`
+targets; block ID markers are hidden in the rendered preview.
 Ordinary Markdown links ending in `.tldraw` use the same hover thumbnail,
 including percent-encoded paths and canvas filenames containing parentheses.
 HTTP and HTTPS links show a sanitized, scrollable page excerpt without running
@@ -82,10 +87,13 @@ Agents in newly started sessions can query the same history with the
 `query_thinking_trails` tool. Hover history is treated as curiosity rather
 than endorsement.
 
-In an existing thread's chat composer, type `[[` followed by part of a note
-name to open autocomplete. Search terms can be out of order and tolerate small
-typos. Use the arrow keys to move, **Enter** or **Tab** to insert the selected
-workspace-relative wikilink, and **Escape** to dismiss the menu. The workspace
+In an existing thread's chat composer or the live note editor, type `[[`
+followed by part of a note name to open autocomplete. Search terms can be out of order and tolerate small
+typos. Use the arrow keys to move, **Enter** or a click to insert the selected
+workspace-relative wikilink and open its note, **Tab** to insert only, and
+**Escape** to dismiss the menu. Hover a suggestion for a preview. In the chat
+composer, Command-hover a completed wikilink to preview it and Command-click
+to open it. The live editor places its autocomplete menu at the caret. The workspace
 path index is warmed when the thread opens, cached while typing, and refreshed
 in the background. The menu follows the wikilink containing the caret, whether
 the link is still open or already closed, and stays visible while its results
@@ -138,7 +146,10 @@ Basename-only links are resolved against Markdown files in the workspace.
 Same-folder matches win, followed by root-relative matches and then the
 shortest deterministic basename match. Explicit Markdown paths are checked
 directly and may point elsewhere on the same host. Missing targets remain
-clickable with a dashed underline and use the inferred path.
+clickable with a dashed underline and use the inferred path. Explicitly opening
+a missing Markdown note creates an empty file and any parent folders, using an
+atomic create-only write so another client's new note is preserved. Hovering a
+missing link does not create a note.
 
 ## Development
 
@@ -155,7 +166,7 @@ After installation, choose **Obsidian at Home** for Markdown under
 
 ## Data and network behavior
 
-Notes remain Markdown files on the selected BB host. Edits write to those files through BB's file API. Thinking trails are recorded automatically during qualifying note-preview navigation and stored in BB-managed plugin SQLite storage. They contain note labels and file targets, parent relationships, timestamps, dwell time, and interactions. The agent tool can query recent trails across threads, optionally filtered by note. Retrieved trail information becomes part of that agent's context; the engagement score is a heuristic, not a statement of agreement.
+Notes remain Markdown files on the selected BB host. Unsaved editor drafts are also kept in browser session storage to recover across editor remounts. Edits write to those files through BB's file API. Thinking trails are recorded automatically during qualifying note-preview navigation and stored in BB-managed plugin SQLite storage. They contain note labels and file targets, parent relationships, timestamps, dwell time, and interactions. The agent tool can query recent trails across threads, optionally filtered by note. Retrieved trail information becomes part of that agent's context; the engagement score is a heuristic, not a statement of agreement.
 
 Hovering a website link makes an HTTP(S) request from the BB server to that site. The preview does not use your browser's signed-in session or execute the site's scripts. Requests have time and size limits, reject local/private destinations at URL validation, and validate redirects. No separate account, API key, or analytics service is required.
 

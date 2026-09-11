@@ -22,32 +22,32 @@ describe("resolveWikilinkPath", () => {
   const paths = [
     "Roadmap.md",
     "archive/Strategy.md",
-    "examples/Strategy.md",
-    "examples/Current note.md",
-    "examples/Version 1.2.md",
+    "websim/Strategy.md",
+    "websim/Current note.md",
+    "websim/Version 1.2.md",
   ];
 
   it("prefers a note in the current folder", () => {
     expect(
-      resolveWikilinkPath("Strategy", "examples/Current note.md", paths),
-    ).toEqual({ path: "examples/Strategy.md", exists: true });
+      resolveWikilinkPath("Strategy", "websim/Current note.md", paths),
+    ).toEqual({ path: "websim/Strategy.md", exists: true });
   });
 
   it("resolves a root-relative path and ignores heading fragments", () => {
     expect(
-      resolveWikilinkPath("archive/Strategy#Decision", "examples/Current note.md", paths),
+      resolveWikilinkPath("archive/Strategy#Decision", "websim/Current note.md", paths),
     ).toEqual({ path: "archive/Strategy.md", exists: true });
   });
 
   it("supports periods in extensionless note names", () => {
     expect(
-      resolveWikilinkPath("Version 1.2", "examples/Current note.md", paths),
-    ).toEqual({ path: "examples/Version 1.2.md", exists: true });
+      resolveWikilinkPath("Version 1.2", "websim/Current note.md", paths),
+    ).toEqual({ path: "websim/Version 1.2.md", exists: true });
   });
 
   it("keeps missing notes clickable at an inferred same-folder path", () => {
     expect(
-      resolveWikilinkPath("Future note", "examples/Current note.md", paths),
-    ).toEqual({ path: "examples/Future note.md", exists: false });
+      resolveWikilinkPath("Future note", "websim/Current note.md", paths),
+    ).toEqual({ path: "websim/Future note.md", exists: false });
   });
 });

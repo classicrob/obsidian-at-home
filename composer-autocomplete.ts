@@ -1,3 +1,12 @@
+import {
+  CHAT_WIKILINK_HOVER_EVENT,
+  CHAT_WIKILINK_LEAVE_EVENT,
+  CHAT_WIKILINK_OPEN_EVENT,
+  type ChatWikilinkHoverDetail,
+  type ChatWikilinkOpenDetail,
+} from "./chat-wikilinks.js";
+import { elementRect, type HoverAnchorRect } from "./hover-types.js";
+
 export const COMPOSER_WIKILINK_QUERY_EVENT =
   "bb:wikilinks:composer-autocomplete-query";
 export const COMPOSER_WIKILINK_RESULTS_EVENT =
@@ -23,7 +32,8 @@ export interface ComposerWikilinkResultsDetail {
 
 interface ActiveAutocomplete {
   editor: HTMLElement;
-  promptbox: HTMLElement;
+  host: HTMLElement;
+  placement: "above" | "caret";
   bridgeId: string;
   query: string;
   requestId: number;
@@ -32,17 +42,49 @@ interface ActiveAutocomplete {
   selectedIndex: number;
 }
 
+interface ComposerTextLink {
+  editor: HTMLElement;
+  bridgeId: string;
+  node: Text;
+  start: number;
+  end: number;
+  reference: string;
+}
+
 const QUERY_DELAY_MS = 85;
 const MAX_QUERY_LENGTH = 160;
+const CARET_MENU_WIDTH_PX = 352;
+
+// The chat composer (BB's promptbox) and the wikilinks live note editor both
+// host the same autocomplete. The promptbox shows the menu above the box; the
+// note editor shows it at the caret.
+const EDITOR_CONTENT_SELECTOR =
+  "[data-promptbox-editor-content], [data-wikilinks-autocomplete-host]";
+const HOST_SELECTOR = "[data-promptbox], [data-wikilinks-autocomplete-host]";
+const BLOCK_SELECTOR =
+  "p, li, h1, h2, h3, h4, h5, h6, td, th, blockquote, pre, div";
 
 function composerEditor(target: EventTarget | null): HTMLElement | null {
   if (!(target instanceof Element)) return null;
-  const content = target.closest<HTMLElement>(
-    "[data-promptbox-editor-content]",
-  );
+  const content = target.closest<HTMLElement>(EDITOR_CONTENT_SELECTOR);
   if (!content) return null;
   if (content.getAttribute("contenteditable") === "true") return content;
   return content.querySelector<HTMLElement>('[contenteditable="true"]');
+}
+
+function hostFor(editor: HTMLElement): HTMLElement | null {
+  return editor.closest<HTMLElement>(HOST_SELECTOR);
+}
+
+function bridgeIdFor(editor: HTMLElement): string | null {
+  return (
+    editor.closest<HTMLElement>("[data-wikilinks-bridge-id]")?.dataset
+      .wikilinksBridgeId ?? null
+  );
+}
+
+function isPromptbox(host: HTMLElement): boolean {
+  return host.hasAttribute("data-promptbox");
 }
 
 function replacementRangeFor(
@@ -102,11 +144,18 @@ function openTrigger(editor: HTMLElement): {
   }
   const caret = selection.getRangeAt(0);
   if (!editor.contains(caret.endContainer)) return null;
+  // Range.toString() does not insert line breaks between block elements, so a
+  // rich editor's paragraphs would otherwise run together into one "line".
+  const block =
+    caret.endContainer.parentElement?.closest<HTMLElement>(BLOCK_SELECTOR) ??
+    null;
+  const container =
+    block && block !== editor && editor.contains(block) ? block : editor;
   const beforeRange = caret.cloneRange();
-  beforeRange.selectNodeContents(editor);
+  beforeRange.selectNodeContents(container);
   beforeRange.setEnd(caret.endContainer, caret.endOffset);
   const afterRange = caret.cloneRange();
-  afterRange.selectNodeContents(editor);
+  afterRange.selectNodeContents(container);
   afterRange.setStart(caret.endContainer, caret.endOffset);
   const beforeLine = beforeRange.toString().split("\n").at(-1)!;
   const afterLine = afterRange.toString().split("\n", 1)[0]!;
@@ -158,6 +207,135 @@ function replaceSelection(range: Range, value: string): void {
   );
 }
 
+function wikilinkReference(source: string): string {
+  return source.split(/[|#^]/, 1)[0]!.trim();
+}
+
+function caretAtPoint(
+  x: number,
+  y: number,
+): { node: Node; offset: number } | null {
+  const doc = document as Document & {
+    caretPositionFromPoint?(
+      x: number,
+      y: number,
+    ): { offsetNode: Node; offset: number } | null;
+    caretRangeFromPoint?(x: number, y: number): Range | null;
+  };
+  if (typeof doc.caretPositionFromPoint === "function") {
+    const position = doc.caretPositionFromPoint(x, y);
+    return position
+      ? { node: position.offsetNode, offset: position.offset }
+      : null;
+  }
+  if (typeof doc.caretRangeFromPoint === "function") {
+    const range = doc.caretRangeFromPoint(x, y);
+    return range
+      ? { node: range.startContainer, offset: range.startOffset }
+      : null;
+  }
+  return null;
+}
+
+function textLinkRange(link: ComposerTextLink): Range {
+  const range = document.createRange();
+  range.setStart(link.node, link.start);
+  range.setEnd(link.node, link.end);
+  return range;
+}
+
+function rangeContainsPoint(range: Range, x: number, y: number): boolean {
+  const slack = 2;
+  const measurable = range as Range & { getClientRects?: () => DOMRectList };
+  if (typeof measurable.getClientRects !== "function") return false;
+  for (const rect of Array.from(measurable.getClientRects())) {
+    if (
+      x >= rect.left - slack &&
+      x <= rect.right + slack &&
+      y >= rect.top - slack &&
+      y <= rect.bottom + slack
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function anchorFor(range: Range): HoverAnchorRect {
+  const rect = range.getBoundingClientRect();
+  return {
+    top: rect.top,
+    right: rect.right,
+    bottom: rect.bottom,
+    left: rect.left,
+  };
+}
+
+// A complete [[wikilink]] in the chat composer's plain text under the pointer.
+// The live note editor decorates its own wikilinks, so only promptboxes count.
+function composerTextLinkAt(x: number, y: number): ComposerTextLink | null {
+  const editor = composerEditor(document.elementFromPoint(x, y));
+  if (!editor) return null;
+  const host = hostFor(editor);
+  if (!host || !isPromptbox(host)) return null;
+  const bridgeId = bridgeIdFor(editor);
+  if (!bridgeId) return null;
+  const caret = caretAtPoint(x, y);
+  if (
+    !caret ||
+    !(caret.node instanceof Text) ||
+    !editor.contains(caret.node)
+  ) {
+    return null;
+  }
+  for (const match of caret.node.data.matchAll(/\[\[([^\]\n]+)\]\]/g)) {
+    const start = match.index!;
+    const end = start + match[0].length;
+    if (caret.offset < start || caret.offset > end) continue;
+    const reference = wikilinkReference(match[1]!);
+    if (!reference) continue;
+    const link = { editor, bridgeId, node: caret.node, start, end, reference };
+    return rangeContainsPoint(textLinkRange(link), x, y) ? link : null;
+  }
+  return null;
+}
+
+function sameTextLink(
+  left: ComposerTextLink | null,
+  right: ComposerTextLink | null,
+): boolean {
+  if (!left || !right) return left === right;
+  return (
+    left.node === right.node &&
+    left.start === right.start &&
+    left.end === right.end
+  );
+}
+
+function dispatchHover(detail: ChatWikilinkHoverDetail): void {
+  window.dispatchEvent(
+    new CustomEvent<ChatWikilinkHoverDetail>(CHAT_WIKILINK_HOVER_EVENT, {
+      detail,
+    }),
+  );
+}
+
+function dispatchLeave(detail: ChatWikilinkOpenDetail): void {
+  window.dispatchEvent(
+    new CustomEvent<ChatWikilinkOpenDetail>(CHAT_WIKILINK_LEAVE_EVENT, {
+      detail,
+    }),
+  );
+}
+
+function dispatchOpen(detail: ChatWikilinkOpenDetail): void {
+  window.dispatchEvent(
+    new CustomEvent<ChatWikilinkOpenDetail>(CHAT_WIKILINK_OPEN_EVENT, {
+      detail,
+    }),
+  );
+}
+
 export function mountComposerWikilinkAutocomplete(
   signal: AbortSignal,
 ): () => void {
@@ -166,12 +344,21 @@ export function mountComposerWikilinkAutocomplete(
   let queryTimer: number | null = null;
   let nextRequestId = 0;
   let disposed = false;
+  let hoveredSuggestion: { bridgeId: string; reference: string } | null = null;
+  let textLink: ComposerTextLink | null = null;
+  let lastPointer: { x: number; y: number } | null = null;
 
   const clearQueryTimer = () => {
     if (queryTimer !== null) window.clearTimeout(queryTimer);
     queryTimer = null;
   };
+  const leaveSuggestion = () => {
+    if (!hoveredSuggestion) return;
+    dispatchLeave(hoveredSuggestion);
+    hoveredSuggestion = null;
+  };
   const removeMenu = () => {
+    leaveSuggestion();
     menu?.remove();
     menu = null;
   };
@@ -180,7 +367,9 @@ export function mountComposerWikilinkAutocomplete(
     removeMenu();
     active = null;
   };
-  const apply = (index: number) => {
+  // Enter or a click inserts the wikilink and opens the note in the preview;
+  // Tab only inserts.
+  const apply = (index: number, open = true) => {
     const state = active;
     const suggestion = state?.suggestions[index];
     if (!state || !suggestion) return;
@@ -190,10 +379,38 @@ export function mountComposerWikilinkAutocomplete(
       `[[${suggestion.reference}]]`,
     );
     close();
+    if (open) {
+      dispatchOpen({
+        bridgeId: state.bridgeId,
+        reference: suggestion.reference,
+      });
+    }
+  };
+  const placeMenu = (list: HTMLElement, state: ActiveAutocomplete) => {
+    if (state.placement !== "caret") return;
+    list.classList.add("wikilink-autocomplete-caret");
+    const range = state.replacementRange as Range & {
+      getBoundingClientRect?: () => DOMRect;
+    };
+    if (typeof range.getBoundingClientRect !== "function") return;
+    const hostRect = state.host.getBoundingClientRect();
+    const caretRect = range.getBoundingClientRect();
+    const width = Math.min(
+      CARET_MENU_WIDTH_PX,
+      Math.max(160, hostRect.width),
+    );
+    const left = Math.max(
+      0,
+      Math.min(caretRect.left - hostRect.left, hostRect.width - width),
+    );
+    list.style.left = `${left}px`;
+    list.style.top = `${caretRect.bottom - hostRect.top + 6}px`;
+    list.style.width = `${width}px`;
   };
   const renderMenu = () => {
     removeMenu();
     if (!active) return;
+    const state = active;
     const list = document.createElement("div");
     list.className = "wikilink-autocomplete";
     list.dataset.wikilinkAutocomplete = "";
@@ -207,15 +424,17 @@ export function mountComposerWikilinkAutocomplete(
 
     const results = document.createElement("div");
     results.className = "wikilink-autocomplete-results";
-    active.suggestions.forEach((suggestion, index) => {
+    state.suggestions.forEach((suggestion, index) => {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "wikilink-autocomplete-item";
-      button.dataset.selected = index === active!.selectedIndex ? "true" : "false";
+      button.dataset.selected =
+        index === state.selectedIndex ? "true" : "false";
+      button.dataset.wikilinkReference = suggestion.reference;
       button.setAttribute("role", "option");
       button.setAttribute(
         "aria-selected",
-        index === active!.selectedIndex ? "true" : "false",
+        index === state.selectedIndex ? "true" : "false",
       );
       const label = document.createElement("span");
       label.className = "wikilink-autocomplete-label";
@@ -229,9 +448,28 @@ export function mountComposerWikilinkAutocomplete(
       }
       button.addEventListener("pointerdown", (event) => event.preventDefault());
       button.addEventListener("click", () => apply(index));
+      // Resting on a suggestion previews the note, exactly like hovering a
+      // wikilink in a chat message; the card's Open action opens the preview.
+      button.addEventListener("pointerenter", (event) => {
+        leaveSuggestion();
+        hoveredSuggestion = {
+          bridgeId: state.bridgeId,
+          reference: suggestion.reference,
+        };
+        dispatchHover({
+          ...hoveredSuggestion,
+          anchor: elementRect(button),
+          ...(event.metaKey ? { backlinks: true } : {}),
+        });
+      });
+      button.addEventListener("pointerleave", () => {
+        if (hoveredSuggestion?.reference === suggestion.reference) {
+          leaveSuggestion();
+        }
+      });
       results.append(button);
     });
-    if (active.suggestions.length === 0) {
+    if (state.suggestions.length === 0) {
       const empty = document.createElement("div");
       empty.className = "wikilink-autocomplete-empty";
       empty.textContent = "No matching notes";
@@ -241,9 +479,11 @@ export function mountComposerWikilinkAutocomplete(
 
     const hint = document.createElement("div");
     hint.className = "wikilink-autocomplete-hint";
-    hint.textContent = "↑↓ navigate   Enter or Tab select   Esc close";
+    hint.textContent =
+      "↑↓ navigate   Enter insert and open   Tab insert   hover to preview   Esc close";
     list.append(hint);
-    active.promptbox.append(list);
+    placeMenu(list, state);
+    state.host.append(list);
     menu = list;
   };
   const select = (nextIndex: number) => {
@@ -262,16 +502,13 @@ export function mountComposerWikilinkAutocomplete(
   };
   const inspect = (target: EventTarget | null) => {
     const editor = composerEditor(target);
-    const promptbox = editor?.closest<HTMLElement>("[data-promptbox]");
-    const threadWindow = editor?.closest<HTMLElement>(
-      "[data-thread-window][data-wikilinks-bridge-id]",
-    );
-    const bridgeId = threadWindow?.dataset.wikilinksBridgeId;
+    const host = editor ? hostFor(editor) : null;
+    const bridgeId = editor ? bridgeIdFor(editor) : null;
     if (
       !editor ||
-      !promptbox ||
+      !host ||
       !bridgeId ||
-      promptbox.querySelector("[data-promptbox-typeahead-menu]")
+      host.querySelector("[data-promptbox-typeahead-menu]")
     ) {
       close();
       return;
@@ -290,7 +527,8 @@ export function mountComposerWikilinkAutocomplete(
       menu !== null;
     active = {
       editor,
-      promptbox,
+      host,
+      placement: isPromptbox(host) ? "above" : "caret",
       bridgeId,
       query: trigger.query,
       requestId,
@@ -298,7 +536,10 @@ export function mountComposerWikilinkAutocomplete(
       suggestions: keepCurrentMenu ? previous.suggestions : [],
       selectedIndex: keepCurrentMenu ? previous.selectedIndex : 0,
     };
-    if (menu) menu.dataset.loading = "true";
+    if (menu) {
+      menu.dataset.loading = "true";
+      placeMenu(menu, active);
+    }
     queryTimer = window.setTimeout(() => {
       queryTimer = null;
       if (!active || active.requestId !== requestId) return;
@@ -312,12 +553,40 @@ export function mountComposerWikilinkAutocomplete(
       );
     }, QUERY_DELAY_MS);
   };
-  const onInput = (event: Event) => inspect(event.target);
+  // Holding ⌘ over a finished [[wikilink]] in the composer previews it; ⌘-click
+  // opens it. Without the modifier the pointer can rest on the box in peace.
+  const syncTextLink = (modifierHeld: boolean) => {
+    const next =
+      modifierHeld && lastPointer
+        ? composerTextLinkAt(lastPointer.x, lastPointer.y)
+        : null;
+    if (sameTextLink(textLink, next)) return;
+    if (textLink) {
+      dispatchLeave({
+        bridgeId: textLink.bridgeId,
+        reference: textLink.reference,
+      });
+    }
+    textLink = next;
+    if (next) {
+      dispatchHover({
+        bridgeId: next.bridgeId,
+        reference: next.reference,
+        anchor: anchorFor(textLinkRange(next)),
+        immediate: true,
+      });
+    }
+  };
+  const onInput = (event: Event) => {
+    inspect(event.target);
+    syncTextLink(false);
+  };
   const onSelectionChange = () => {
     const editor = composerEditor(document.activeElement);
     if (editor) inspect(editor);
   };
   const onKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "Meta") syncTextLink(true);
     if (!active || !menu) return;
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
@@ -328,7 +597,7 @@ export function mountComposerWikilinkAutocomplete(
     if (event.key === "Enter" || event.key === "Tab") {
       event.preventDefault();
       event.stopPropagation();
-      apply(active.selectedIndex);
+      apply(active.selectedIndex, event.key === "Enter");
       return;
     }
     if (event.key === "Escape") {
@@ -337,11 +606,26 @@ export function mountComposerWikilinkAutocomplete(
       close();
     }
   };
+  const onKeyUp = (event: KeyboardEvent) => {
+    if (event.key === "Meta") syncTextLink(false);
+  };
+  const onPointerMove = (event: PointerEvent) => {
+    lastPointer = { x: event.clientX, y: event.clientY };
+    syncTextLink(event.metaKey);
+  };
   const onPointerDown = (event: PointerEvent) => {
     if (!menu || !(event.target instanceof Node)) return;
     if (!menu.contains(event.target) && !active?.editor.contains(event.target)) {
       close();
     }
+  };
+  const onClick = (event: MouseEvent) => {
+    if (event.button !== 0 || !(event.metaKey || event.ctrlKey)) return;
+    const link = composerTextLinkAt(event.clientX, event.clientY);
+    if (!link) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dispatchOpen({ bridgeId: link.bridgeId, reference: link.reference });
   };
   const onResults = (event: Event) => {
     if (!(event instanceof CustomEvent)) return;
@@ -362,17 +646,24 @@ export function mountComposerWikilinkAutocomplete(
   document.addEventListener("input", onInput, true);
   document.addEventListener("selectionchange", onSelectionChange);
   document.addEventListener("keydown", onKeyDown, true);
+  document.addEventListener("keyup", onKeyUp, true);
+  document.addEventListener("pointermove", onPointerMove, true);
   document.addEventListener("pointerdown", onPointerDown, true);
+  document.addEventListener("click", onClick, true);
   window.addEventListener(COMPOSER_WIKILINK_RESULTS_EVENT, onResults);
 
   const dispose = () => {
     if (disposed) return;
     disposed = true;
     close();
+    syncTextLink(false);
     document.removeEventListener("input", onInput, true);
     document.removeEventListener("selectionchange", onSelectionChange);
     document.removeEventListener("keydown", onKeyDown, true);
+    document.removeEventListener("keyup", onKeyUp, true);
+    document.removeEventListener("pointermove", onPointerMove, true);
     document.removeEventListener("pointerdown", onPointerDown, true);
+    document.removeEventListener("click", onClick, true);
     window.removeEventListener(COMPOSER_WIKILINK_RESULTS_EVENT, onResults);
   };
   signal.addEventListener("abort", dispose, { once: true });

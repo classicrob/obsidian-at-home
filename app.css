@@ -36,9 +36,8 @@
   box-sizing: border-box;
   width: 100%;
   max-width: 56rem;
-  min-height: 100%;
   margin: 0 auto;
-  padding: 1rem 1.75rem 4rem;
+  padding: 1rem 1.75rem 1rem;
   font-size: 15px;
   line-height: 1.75;
 }
@@ -71,7 +70,7 @@
 }
 
 .wikilinks-live-editor .tiptap {
-  min-height: 18rem;
+  min-height: 1.75em;
   outline: none;
   caret-color: var(--foreground);
 }

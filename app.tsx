@@ -1535,7 +1535,7 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
   const editing = editRequested && editorReady;
   return (
     <div className="wikilinks-editor-shell" ref={activeFileRoot}>
-      <div className="wikilinks-savebar" aria-live="polite">
+      <div className="wikilinks-savebar" aria-live="polite" data-bb-preview-file={JSON.stringify({ path, source })}>
         <span>{editing ? "Editing" : "Live preview"}</span>
         <span>
           {editRequested && !editorReady

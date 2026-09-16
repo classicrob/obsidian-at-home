@@ -23,6 +23,10 @@ Use `[[Note title]]` or `[[Note title|Display text]]`. Put heading and block tar
 
 Inside Markdown table cells, escape the alias separator with exactly one backslash: `[[Note title\|Display text]]`. Otherwise the table parser treats it as a column boundary. This applies in both chat and notes. Outside tables, use the ordinary unescaped separator. Do not escape the pipes that delimit table columns.
 
+## Media in Markdown previews
+
+Use Obsidian attachment embeds such as `![[Images/chart.jpg]]` and `![[Images/demo.mp4]]`. The note preview renders images inline and videos/audio with playback controls. Image sizes such as `![[chart.jpg|400]]` are supported. Paths resolve relative to the note, then the workspace root; a bare filename also searches workspace attachments. Media controls do not enter text-editing mode. Files are served through temporary BB preview URLs, including on remote connections. Video and audio pass through a streaming byte-range adapter so mobile Safari can load and seek them.
+
 ## Reconstruct prior exploration
 
 Call `query_thinking_trails` when the user's prior navigation would help: for example, "What was I exploring?" or "How did I get from A to B?" Pass `note` to filter by note name or path and a small `limit` (maximum 20).

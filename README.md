@@ -4,7 +4,7 @@ A community BB plugin for working with connected Markdown notes alongside your a
 
 ## Install and start
 
-Requires BB 0.41 or later and Plugin SDK 0.4.34 or later. Install the tagged release:
+Requires BB 0.41 or later and Plugin SDK 0.4.84 or later. Install the tagged release:
 
 ```sh
 bb plugin install git:https://github.com/classicrob/obsidian-at-home.git@semver:^0.1.0
@@ -18,6 +18,7 @@ The public name is Obsidian at Home; its stable plugin ID remains `wikilinks`. E
 
 - Markdown reading and editing with autosave and conflict detection.
 - Wikilinks in notes and chat, plus note autocomplete in the chat composer.
+- Obsidian attachment embeds for images, video, and audio in Markdown previews, including mobile playback.
 - Recursive note and website previews, contextual backlinks, and canvas thumbnails.
 - A Thinking trails panel and the `query_thinking_trails` agent tool.
 - The bundled `obsidian-at-home` skill explaining these features to agents. It becomes available when a new agent session starts; no separate skill installation is needed.
@@ -98,6 +99,19 @@ path index is warmed when the thread opens, cached while typing, and refreshed
 in the background. The menu follows the wikilink containing the caret, whether
 the link is still open or already closed, and stays visible while its results
 update. Choosing a result replaces that complete wikilink span.
+
+## Images, video, and audio
+
+Embed workspace attachments with Obsidian syntax: `![[Images/chart.jpg]]`,
+`![[Images/demo.mp4]]`, or `![[Images/recording.mp3]]`. Images render inline;
+video and audio show native playback controls. Image dimensions such as
+`![[chart.jpg|400]]` and `![[chart.jpg|400x300]]` are supported.
+
+Paths resolve relative to the note first, then the workspace root. A bare
+filename also searches workspace attachments. Playback controls keep the note
+in preview mode. Temporary BB preview URLs allow attachments to load through
+remote connections, and byte-range streaming supports mobile Safari playback
+and seeking.
 
 ## Backlinks in document
 

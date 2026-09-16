@@ -10,9 +10,69 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
+// media-response.ts
+async function mediaResponse(request, upstream) {
+  if (!upstream.ok || upstream.status === 206) return upstream;
+  const headers = new Headers(upstream.headers);
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Cache-Control", "private, no-cache");
+  const rawSize = headers.get("Content-Length");
+  const size = rawSize === null ? NaN : Number(rawSize);
+  const range = request.headers.get("Range");
+  const ifRange = request.headers.get("If-Range");
+  const canRange = request.method !== "HEAD" && (!ifRange || ifRange === headers.get("ETag") || ifRange === headers.get("Last-Modified"));
+  const match = canRange && range && /^bytes=(\d*)-(\d*)$/.exec(range);
+  if (request.method === "HEAD") {
+    await upstream.body?.cancel();
+    return new Response(null, { status: 200, headers });
+  }
+  if (!match || !Number.isSafeInteger(size) || !upstream.body) return new Response(upstream.body, { status: upstream.status, headers });
+  const start = match[1] ? Number(match[1]) : Math.max(0, size - Number(match[2]));
+  const end = match[1] && match[2] ? Math.min(size - 1, Number(match[2])) : size - 1;
+  if (!match[1] && !match[2] || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= size || start > end) {
+    await upstream.body.cancel();
+    headers.set("Content-Range", `bytes */${size}`);
+    headers.set("Content-Length", "0");
+    return new Response(null, { status: 416, headers });
+  }
+  headers.set("Content-Range", `bytes ${start}-${end}/${size}`);
+  headers.set("Content-Length", String(end - start + 1));
+  const reader = upstream.body.getReader();
+  let offset = 0;
+  const body = new ReadableStream({
+    async pull(controller) {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            controller.close();
+            return;
+          }
+          const chunkStart = offset;
+          offset += value.length;
+          if (offset <= start) continue;
+          const bytes = value.subarray(Math.max(0, start - chunkStart), Math.min(value.length, end + 1 - chunkStart));
+          if (bytes.length) controller.enqueue(bytes);
+          if (offset > end) {
+            controller.close();
+            await reader.cancel();
+          }
+          return;
+        }
+      } catch (error61) {
+        controller.error(error61);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    }
+  });
+  return new Response(body, { status: 206, headers });
+}
+
 // server.ts
 import path3 from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 
@@ -18920,6 +18980,13 @@ function extractLocalMarkdownPaths(markdown) {
   }
   return [...paths];
 }
+function mediaKind(reference) {
+  const file2 = reference.split("#", 1)[0].trim();
+  if (/\.(png|jpe?g|gif|webp|svg|avif|bmp)$/i.test(file2)) return "image";
+  if (/\.(mp4|webm|mov|m4v|ogv)$/i.test(file2)) return "video";
+  if (/\.(mp3|wav|ogg|m4a|flac)$/i.test(file2)) return "audio";
+  return null;
+}
 
 // wikilinks.ts
 import path from "node:path";
@@ -19890,6 +19957,10 @@ var rpcContract = defineRpcContract({
         sha256: external_exports.string()
       }).strict()
     ])
+  },
+  resolve_media: {
+    input: external_exports.object({ path: external_exports.string().min(1), source: openerSourceSchema, reference: external_exports.string().min(1) }).strict(),
+    output: external_exports.object({ url: external_exports.string().nullable(), expiresAtMs: external_exports.number() }).strict()
   },
   resolve_markdown_links: {
     input: external_exports.object({
@@ -20884,6 +20955,14 @@ async function resolveOpenContext(bb, source, filePath) {
   throw new Error("This Markdown source cannot be opened by Obsidian at Home");
 }
 async function plugin(bb) {
+  const mediaTickets = /* @__PURE__ */ new Map();
+  for (const method of ["GET", "HEAD"]) bb.http.route(method, "/media", async (c) => {
+    const ticket = mediaTickets.get(c.req.query("key") ?? "");
+    if (!ticket || ticket.expiresAtMs <= Date.now()) return new Response("Attachment link expired", { status: 404 });
+    const upstream = await fetch(new URL(ticket.url, bb.server.loopbackBaseUrl), { signal: c.req.raw.signal });
+    return mediaResponse(c.req.raw, upstream);
+  });
+  bb.onDispose(() => mediaTickets.clear());
   autocompleteIndexCache.clear();
   backlinkIndexCache.clear();
   webPreviewCache.clear();
@@ -20996,6 +21075,31 @@ async function plugin(bb) {
         content: file2.contentEncoding === "base64" ? Buffer.from(file2.content, "base64").toString("utf8") : file2.content,
         sha256: file2.sha256
       };
+    },
+    async resolve_media({ path: filePath, source, reference }) {
+      if (!mediaKind(reference)) throw new Error("Unsupported attachment type");
+      const context = await resolveOpenContext(bb, source, filePath);
+      const requested = reference.split("#", 1)[0].trim().replace(/\\/g, "/");
+      if (isAbsoluteHostPath(requested) || /^[a-z][a-z0-9+.-]*:/i.test(requested)) throw new Error("Attachments must be within the note workspace");
+      const candidates = [.../* @__PURE__ */ new Set([
+        path3.posix.join(path3.posix.dirname(context.currentRelativePath), requested),
+        path3.posix.normalize(requested)
+      ])].filter((p) => p !== ".." && !p.startsWith("../") && !path3.posix.isAbsolute(p));
+      const { existence } = await bb.sdk.hosts.pathsExist({ hostId: context.hostId, paths: candidates.map((p) => joinHostPath(context.rootPath, p)) });
+      let found = candidates.find((p) => existence[joinHostPath(context.rootPath, p)]);
+      if (!found && !requested.includes("/")) {
+        const listing = await bb.sdk.files.listPaths({ hostId: context.hostId, path: context.rootPath, query: requested, limit: 1e3, includeFiles: true, includeDirectories: false });
+        found = listing.paths.map((p) => p.path).filter((p) => !p.startsWith("../") && !path3.posix.isAbsolute(p) && path3.posix.basename(p).toLocaleLowerCase() === requested.toLocaleLowerCase()).sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b))[0];
+      }
+      if (!found) return { url: null, expiresAtMs: 0 };
+      const preview = await bb.sdk.files.createPreview({ hostId: context.hostId, rootPath: joinHostPath(context.rootPath, path3.posix.dirname(found)), ttlMs: 60 * 6e4 });
+      const url2 = `${preview.baseUrl.replace(/\/$/, "")}/${encodeURIComponent(path3.posix.basename(found))}`;
+      if (mediaKind(reference) === "image") return { url: url2, expiresAtMs: preview.expiresAtMs };
+      for (const [key2, ticket] of mediaTickets) if (ticket.expiresAtMs <= Date.now()) mediaTickets.delete(key2);
+      if (mediaTickets.size >= 4096) mediaTickets.delete(mediaTickets.keys().next().value);
+      const key = randomUUID();
+      mediaTickets.set(key, { url: url2, expiresAtMs: preview.expiresAtMs });
+      return { url: `/api/v1/plugins/wikilinks/http/media?key=${key}`, expiresAtMs: preview.expiresAtMs };
     },
     async resolve_markdown_links({ path: filePath, source, content }) {
       const context = await resolveOpenContext(bb, source, filePath);

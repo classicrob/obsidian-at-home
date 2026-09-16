@@ -1,9 +1,11 @@
+import { mediaResponse } from "./media-response.js";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
+  mediaKind,
   decodeLocalMarkdownPath,
   extractLocalMarkdownPaths,
 } from "./wikilink-markdown.js";
@@ -196,6 +198,10 @@ export const rpcContract = defineRpcContract({
         })
         .strict(),
     ]),
+  },
+  resolve_media: {
+    input: z.object({ path: z.string().min(1), source: openerSourceSchema, reference: z.string().min(1) }).strict(),
+    output: z.object({ url: z.string().nullable(), expiresAtMs: z.number() }).strict(),
   },
   resolve_markdown_links: {
     input: z
@@ -1612,6 +1618,14 @@ async function resolveOpenContext(
 }
 
 export default async function plugin(bb: BbPluginApi) {
+  const mediaTickets = new Map<string, { url: string; expiresAtMs: number }>();
+  for (const method of ["GET", "HEAD"]) bb.http.route(method, "/media", async (c) => {
+    const ticket = mediaTickets.get(c.req.query("key") ?? "");
+    if (!ticket || ticket.expiresAtMs <= Date.now()) return new Response("Attachment link expired", { status: 404 });
+    const upstream = await fetch(new URL(ticket.url, bb.server.loopbackBaseUrl), { signal: c.req.raw.signal });
+    return mediaResponse(c.req.raw, upstream);
+  });
+  bb.onDispose(() => mediaTickets.clear());
   autocompleteIndexCache.clear();
   backlinkIndexCache.clear();
   webPreviewCache.clear();
@@ -1737,6 +1751,30 @@ export default async function plugin(bb: BbPluginApi) {
             : file.content,
         sha256: file.sha256,
       };
+    },
+    async resolve_media({ path: filePath, source, reference }) {
+      if (!mediaKind(reference)) throw new Error("Unsupported attachment type");
+      const context = await resolveOpenContext(bb, source, filePath);
+      const requested = reference.split("#", 1)[0]!.trim().replace(/\\/g, "/");
+      if (isAbsoluteHostPath(requested) || /^[a-z][a-z0-9+.-]*:/i.test(requested)) throw new Error("Attachments must be within the note workspace");
+      const candidates = [...new Set([
+        path.posix.join(path.posix.dirname(context.currentRelativePath), requested), path.posix.normalize(requested),
+      ])].filter(p => p !== ".." && !p.startsWith("../") && !path.posix.isAbsolute(p));
+      const { existence } = await bb.sdk.hosts.pathsExist({ hostId: context.hostId, paths: candidates.map(p => joinHostPath(context.rootPath, p)) });
+      let found = candidates.find(p => existence[joinHostPath(context.rootPath, p)]);
+      if (!found && !requested.includes("/")) {
+        const listing = await bb.sdk.files.listPaths({ hostId: context.hostId, path: context.rootPath, query: requested, limit: 1000, includeFiles: true, includeDirectories: false });
+        found = listing.paths.map(p => p.path).filter(p => !p.startsWith("../") && !path.posix.isAbsolute(p) && path.posix.basename(p).toLocaleLowerCase() === requested.toLocaleLowerCase()).sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b))[0];
+      }
+      if (!found) return { url: null, expiresAtMs: 0 };
+      const preview = await bb.sdk.files.createPreview({ hostId: context.hostId, rootPath: joinHostPath(context.rootPath, path.posix.dirname(found)), ttlMs: 60 * 60_000 });
+      const url = `${preview.baseUrl.replace(/\/$/, "")}/${encodeURIComponent(path.posix.basename(found))}`;
+      if (mediaKind(reference) === "image") return { url, expiresAtMs: preview.expiresAtMs };
+      for (const [key, ticket] of mediaTickets) if (ticket.expiresAtMs <= Date.now()) mediaTickets.delete(key);
+      if (mediaTickets.size >= 4096) mediaTickets.delete(mediaTickets.keys().next().value!);
+      const key = randomUUID();
+      mediaTickets.set(key, { url, expiresAtMs: preview.expiresAtMs });
+      return { url: `/api/v1/plugins/wikilinks/http/media?key=${key}`, expiresAtMs: preview.expiresAtMs };
     },
     async resolve_markdown_links({ path: filePath, source, content }) {
       const context = await resolveOpenContext(bb, source, filePath);

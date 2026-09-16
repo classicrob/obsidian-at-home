@@ -50,6 +50,7 @@ interface MarkdownNode {
   value?: string;
   url?: string;
   depth?: number;
+  alt?: string;
   children?: MarkdownNode[];
   data?: { hProperties?: Record<string, unknown>; [key: string]: unknown };
 }
@@ -138,20 +139,23 @@ export function displayWikilinkLabel(
   return basename.replace(/\.(?:md|markdown|tldraw)$/i, "");
 }
 
-export function splitWikilinkText(value: string): MarkdownNode[] | null {
-  const pattern = /\[\[([^\]\n]+)\]\]/g;
+export function splitWikilinkText(value: string, includeMedia = false): MarkdownNode[] | null {
+  const pattern = /(!?)\[\[([^\]\n]+)\]\]/g;
   const nodes: MarkdownNode[] = [];
   let cursor = 0;
   for (const match of value.matchAll(pattern)) {
     const start = match.index;
-    if (start > 0 && value[start - 1] === "!") continue;
+    const embed = match[1] === "!";
+    if (embed && (!includeMedia || !mediaKind(match[2]!.split("|", 1)[0]!))) continue;
     if (start > cursor) {
       nodes.push({ type: "text", value: value.slice(cursor, start) });
     }
-    const [rawReference, rawAlias] = match[1]!.split("|", 2);
+    const [rawReference, rawAlias] = match[2]!.split("|", 2);
     const reference = rawReference!.trim();
     if (reference === "") {
       nodes.push({ type: "text", value: match[0] });
+    } else if (embed) {
+      nodes.push({ type: "image", url: `${WIKIMEDIA_URL_PREFIX}${encodeURIComponent(reference)}`, alt: rawAlias?.trim() ?? "" });
     } else {
       nodes.push({
         type: "link",
@@ -173,23 +177,23 @@ export function splitWikilinkText(value: string): MarkdownNode[] | null {
   return nodes;
 }
 
-function transformChildren(node: MarkdownNode): void {
+function transformChildren(node: MarkdownNode, includeMedia: boolean): void {
   if (!node.children) return;
   const nextChildren: MarkdownNode[] = [];
   for (const child of node.children) {
     if (child.type === "text" && typeof child.value === "string") {
-      nextChildren.push(...(splitWikilinkText(child.value) ?? [child]));
+      nextChildren.push(...(splitWikilinkText(child.value, includeMedia) ?? [child]));
     } else {
-      transformChildren(child);
+      transformChildren(child, includeMedia);
       nextChildren.push(child);
     }
   }
   node.children = nextChildren;
 }
 
-export function remarkWikilinks() {
+export function remarkWikilinks(options: { media?: boolean } = {}) {
   return (tree: MarkdownNode) => {
-    transformChildren(tree);
+    transformChildren(tree, options.media === true);
   };
 }
 
@@ -200,4 +204,17 @@ export function decodeWikilinkUrl(url: string): string | null {
   } catch {
     return null;
   }
+}
+
+export const WIKIMEDIA_URL_PREFIX = "bb-wikimedia:";
+export function mediaKind(reference: string): "image" | "video" | "audio" | null {
+  const file = reference.split("#", 1)[0]!.trim();
+  if (/\.(png|jpe?g|gif|webp|svg|avif|bmp)$/i.test(file)) return "image";
+  if (/\.(mp4|webm|mov|m4v|ogv)$/i.test(file)) return "video";
+  if (/\.(mp3|wav|ogg|m4a|flac)$/i.test(file)) return "audio";
+  return null;
+}
+export function decodeWikimediaUrl(url: string): string | null {
+  if (!url.startsWith(WIKIMEDIA_URL_PREFIX)) return null;
+  try { return decodeURIComponent(url.slice(WIKIMEDIA_URL_PREFIX.length)); } catch { return null; }
 }

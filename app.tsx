@@ -51,6 +51,7 @@ import {
   type HoverPreviewData,
 } from "./hover-preview.js";
 import { elementRect, type HoverAnchorRect } from "./hover-types.js";
+import { WikilinkMedia } from "./wikilink-media.js";
 import { InstantMarkdownPreview } from "./instant-markdown-preview.js";
 import { displayWikilinkLabel, parseWikilinkSubpath } from "./wikilink-markdown.js";
 import { parseMarkdownDocument } from "./markdown-document.js";
@@ -1502,10 +1503,15 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
     rpc,
   ]);
 
+  const renderPreviewMedia = useCallback(
+    (reference: string, alias: string) => <WikilinkMedia reference={reference} alias={alias} path={path} source={openerSource} />,
+    [path, openerSource],
+  );
+
   const requestEdit = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
     if (
       event.target instanceof Element &&
-      event.target.closest("a, button, input, textarea, select, label")
+      event.target.closest("a, button, input, textarea, select, label, video, audio, img, [data-wikilink-media]")
     ) {
       return;
     }
@@ -1589,6 +1595,7 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
           >
             <InstantMarkdownPreview
               content={result.content}
+              renderMedia={renderPreviewMedia}
               renderNoteLink={renderPreviewNoteLink}
               renderUrlLink={renderWebLink}
             />

@@ -1,11 +1,11 @@
 {
   "sdkMajor": 0,
-  "sdkVersion": "0.4.84",
+  "sdkVersion": "0.6.39",
   "artifactFormatVersion": 1,
   "pluginId": "wikilinks",
   "pluginVersion": "0.1.0",
   "builtWith": {
-    "bbVersion": "0.43.1-nightly.34653934911.1",
-    "pluginSdkVersion": "0.4.84"
+    "bbVersion": "0.46.1-nightly.38298743325.1",
+    "pluginSdkVersion": "0.6.39"
   }
 }

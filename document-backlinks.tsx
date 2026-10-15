@@ -2,6 +2,7 @@
 // it scrolls with the content. Data comes from the vault-graph plugin's RPC
 // (notes, canvases, threads, unlinked mentions); when that plugin is missing or
 // unreachable the section falls back to wikilinks' own contextual backlinks.
+import { ThreadBacklinkGroup, type LoadThreadContext, type RenderThreadNoteLink } from "./thread-backlink-group.js";
 import {
   useCallback,
   useEffect,
@@ -50,6 +51,8 @@ export interface DocumentBacklinksProps {
   /** Wraps a note or canvas title in the hover-previewing file link. */
   renderSourceLink: (group: DocumentBacklinkGroup, children: ReactNode) => ReactNode;
   onOpenThread: (threadId: string) => void;
+  loadThreadContext?: LoadThreadContext;
+  renderThreadNoteLink?: RenderThreadNoteLink;
 }
 
 async function loadFromVaultGraph(
@@ -92,15 +95,21 @@ function BacklinkGroupList({
   title,
   renderSourceLink,
   onOpenThread,
+  loadThreadContext,
+  renderThreadNoteLink,
 }: {
   groups: DocumentBacklinkGroup[];
   title: string;
   renderSourceLink: DocumentBacklinksProps["renderSourceLink"];
   onOpenThread: DocumentBacklinksProps["onOpenThread"];
+  loadThreadContext?: LoadThreadContext;
+  renderThreadNoteLink?: RenderThreadNoteLink;
 }) {
   return (
     <ul className="wikilinks-document-backlink-list">
-      {groups.map((group) => (
+      {groups.map((group) => group.kind === "thread" && group.threadId ? (
+        <ThreadBacklinkGroup key={group.key} group={group} loadContext={loadThreadContext} renderNoteLink={renderThreadNoteLink} onOpen={onOpenThread} />
+      ) : (
         <li className="wikilinks-document-backlink-group" key={group.key}>
           <div className="wikilinks-document-backlink-source">
             {group.kind === "thread" && group.threadId ? (
@@ -153,6 +162,8 @@ export function DocumentBacklinks({
   loadFallback,
   renderSourceLink,
   onOpenThread,
+  loadThreadContext,
+  renderThreadNoteLink,
 }: DocumentBacklinksProps) {
   const sourceKey = JSON.stringify(source);
   const [data, setData] = useState<DocumentBacklinksData | null>(null);
@@ -299,6 +310,8 @@ export function DocumentBacklinks({
                 title={title}
                 renderSourceLink={renderSourceLink}
                 onOpenThread={onOpenThread}
+                loadThreadContext={loadThreadContext}
+                renderThreadNoteLink={renderThreadNoteLink}
               />
             )}
             {data && data.provider === "vault-graph" ? (
@@ -331,6 +344,8 @@ export function DocumentBacklinks({
                       title={title}
                       renderSourceLink={renderSourceLink}
                       onOpenThread={onOpenThread}
+                loadThreadContext={loadThreadContext}
+                renderThreadNoteLink={renderThreadNoteLink}
                     />
                   )
                 ) : null}

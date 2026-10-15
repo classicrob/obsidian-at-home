@@ -1232,6 +1232,16 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
     const preview = await rpc.call("preview_file", { target, backlinks: true });
     return preview.backlinks ?? [];
   }, [openerSource, path, rpc]);
+  const loadThreadBacklinkContext = useCallback(
+    (threadId: string) => rpc.call("thread_backlink_context", { threadId, path, source: openerSource }),
+    [rpc, path, openerSource],
+  );
+  const renderThreadBacklinkNoteLink = useCallback(
+    (link: HoverPreviewData["links"][number], children: ReactNode) => (
+      <PreviewingFileLink reference={link.reference} target={link.target} exists={link.exists} relation="backlink">{children}</PreviewingFileLink>
+    ),
+    [],
+  );
   const renderBacklinkSourceLink = useCallback(
     (group: DocumentBacklinkGroup, children: ReactNode) =>
       group.target ? (
@@ -1631,6 +1641,8 @@ function WikilinkFileOpener({ path, source, Original }: PluginFileOpenerProps) {
             refreshToken={backlinksRefresh}
             loadFallback={loadFallbackBacklinks}
             renderSourceLink={renderBacklinkSourceLink}
+            loadThreadContext={loadThreadBacklinkContext}
+            renderThreadNoteLink={renderThreadBacklinkNoteLink}
             onOpenThread={(threadId) => navigate.toThread(threadId)}
           />
         ) : null}
@@ -2321,7 +2333,7 @@ function ThinkingTrailsPanel({ threadId }: PluginThreadPanelProps) {
 export default definePluginApp((app) => {
   app.slots.fileOpener({
     id: "obsidian-wikilinks",
-    title: "Obsidian at Home",
+    title: "Wikilinks live editor",
     extensions: ["md", "markdown"],
     component: TrackedWikilinkFileOpener,
   });

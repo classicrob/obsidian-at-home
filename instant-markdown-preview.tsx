@@ -1,3 +1,5 @@
+import { OutlineListItem, OutlineSection, rehypeOutline } from "./outline-preview.js";
+import { CalloutBlockquote, remarkCallouts } from "./callouts.js";
 import { useMemo, type ReactNode } from "react";
 import ReactMarkdown, {
   defaultUrlTransform,
@@ -9,9 +11,12 @@ import {
   WIKIMEDIA_URL_PREFIX,
   decodeLocalMarkdownPath,
   decodeWikilinkUrl,
+  IFRAME_EMBED_TAG,
+  remarkIframeEmbeds,
   remarkWikilinks,
   WIKILINK_URL_PREFIX,
 } from "./wikilink-markdown.js";
+import { IframeEmbeds } from "./iframe-embed-view.js";
 import { parseMarkdownDocument } from "./markdown-document.js";
 
 function markdownComponents(
@@ -19,7 +24,21 @@ function markdownComponents(
   renderUrlLink: (url: string, children: ReactNode) => ReactNode,
   renderMedia?: (reference: string, alias: string) => ReactNode,
 ): Components {
+  // `wikilinks-iframe` is a custom element produced by remarkIframeEmbeds.
+  const iframeComponents = {
+    [IFRAME_EMBED_TAG]: ({ node }: { node?: { properties?: Record<string, unknown> } }) => (
+      <IframeEmbeds
+        html={String(node?.properties?.dataHtml ?? "")}
+        inline={node?.properties?.dataInline === "true"}
+        renderUrlLink={renderUrlLink}
+      />
+    ),
+  } as Partial<Components>;
   return {
+    ...iframeComponents,
+    blockquote: CalloutBlockquote,
+    div: OutlineSection,
+    li: OutlineListItem,
     img: ({ node: _node, src = "", alt = "", ...props }) => {
       const reference = decodeWikimediaUrl(src);
       if (reference !== null) return <>{renderMedia?.(reference, alt) ?? `![[${reference}]]`}</>;
@@ -59,7 +78,8 @@ export function InstantMarkdownPreview({
   );
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, [remarkWikilinks, { media: true }]]}
+      remarkPlugins={[remarkGfm, remarkIframeEmbeds, remarkCallouts, [remarkWikilinks, { media: true }]]}
+      rehypePlugins={[rehypeOutline]}
       components={components}
       urlTransform={(url) =>
         url.startsWith(WIKIMEDIA_URL_PREFIX) || url.startsWith(WIKILINK_URL_PREFIX) || decodeLocalMarkdownPath(url)

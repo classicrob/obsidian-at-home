@@ -1,3 +1,4 @@
+import { extractThreadBacklinks, loadThreadMessages } from "./thread-backlinks.js";
 import { mediaResponse } from "./media-response.js";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -261,6 +262,14 @@ export const rpcContract = defineRpcContract({
       })
       .strict(),
     output: hoverPreviewSchema,
+  },
+  thread_backlink_context: {
+    input: z.object({ threadId: z.string().min(1), path: z.string().min(1), source: openerSourceSchema }).strict(),
+    output: z.object({
+      occurrences: z.array(z.object({ messageId: z.string(), role: z.enum(["user", "assistant"]), createdAt: z.number(), context: z.string(), preview: z.string(), focusLabel: z.string(), userPrompt: z.string().nullable() })),
+      truncated: z.boolean(),
+      links: z.array(resolvedLinkSchema),
+    }).strict(),
   },
   preview_url: {
     input: z.object({ url: z.string().url().max(8_192) }).strict(),
@@ -1614,10 +1623,12 @@ async function resolveOpenContext(
     };
   }
 
-  throw new Error("This Markdown source cannot be opened by Obsidian at Home");
+  throw new Error("This Markdown source cannot be opened by Wikilinks");
 }
 
 export default async function plugin(bb: BbPluginApi) {
+  const threadContextCache = new Map<string, { expires: number; promise: ReturnType<typeof loadThreadMessages> }>();
+  bb.onDispose(() => threadContextCache.clear());
   const mediaTickets = new Map<string, { url: string; expiresAtMs: number }>();
   for (const method of ["GET", "HEAD"]) bb.http.route(method, "/media", async (c) => {
     const ticket = mediaTickets.get(c.req.query("key") ?? "");
@@ -1706,7 +1717,7 @@ export default async function plugin(bb: BbPluginApi) {
         controller.signal.throwIfAborted();
         stage = "read file";
         const unchangedSha = await unchangedNoteSha(bb, context);
-        if (unchangedSha !== null && unchangedSha === knownSha256) return { unchangedSha, context };
+        if (unchangedSha !== null) return { unchangedSha, context };
         const local = await readLocalNote(bb, context);
         if (local) return { local, context };
         controller.signal.throwIfAborted();
@@ -1815,6 +1826,29 @@ export default async function plugin(bb: BbPluginApi) {
     async resolve_chat_wikilink({ threadId, source, path, reference }) {
       return resolveChatWikilink(bb, { threadId, source, path }, reference);
     },
+    async thread_backlink_context({ threadId, path: filePath, source }) {
+      const context = await resolveOpenContext(bb, source, filePath);
+      const index = await cachedAutocompleteIndex(bb, context);
+      const resolver = cachedWikilinkPathResolver(index.paths);
+      let cached = threadContextCache.get(threadId);
+      if (!cached || cached.expires < Date.now()) {
+        if (threadContextCache.size >= 32) threadContextCache.delete(threadContextCache.keys().next().value!);
+        const promise = loadThreadMessages(bb, threadId);
+        cached = { expires: Date.now() + 30_000, promise };
+        threadContextCache.set(threadId, cached);
+        promise.catch(() => { if (threadContextCache.get(threadId)?.promise === promise) threadContextCache.delete(threadId); });
+      }
+      const loaded = await cached.promise;
+      const result = extractThreadBacklinks(loaded.messages, reference => {
+        const relative = reference.startsWith(`${context.rootPath}/`) ? reference.slice(context.rootPath.length + 1) : reference;
+        return resolver(relative, "")?.toLocaleLowerCase() === context.currentRelativePath.toLocaleLowerCase();
+      });
+      return {
+        ...result,
+        truncated: loaded.truncated || result.truncated,
+        links: await resolveLinks(bb, result.occurrences.map(item => item.preview).join("\n"), { ...context, currentRelativePath: "" }, index),
+      };
+    },
     async preview_file({ target, backlinks }) {
       return previewFile(bb, target, backlinks);
     },
@@ -1900,8 +1934,8 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.agents.configure(() => ({
     tools: ["query_thinking_trails"],
-    skills: ["obsidian-at-home"],
+    skills: ["wikilinks"],
     instructions:
-      "Thinking trails record note paths the user explored. Hover indicates curiosity; a clicked step is a stronger attention signal. Query them when reconstructing prior working context would help. When writing aliased wikilinks inside Markdown table cells, escape the alias pipe with one backslash: [[Note title\\|Display text]]. Outside tables use [[Note title|Display text]].",
+      "Thinking trails record note paths the user explored. Hover indicates curiosity; a clicked step is a stronger attention signal. Query them when reconstructing prior working context would help. When writing aliased wikilinks inside Markdown table cells, escape the alias pipe with one backslash: [[Note title\|Display text]]. Outside tables use [[Note title|Display text]].",
   }));
 }

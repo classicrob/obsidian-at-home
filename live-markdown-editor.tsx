@@ -1,3 +1,6 @@
+import { OutlineEditor } from "./outline-editor.js";
+import { CalloutEditor } from "./callout-editor.js";
+import { RawIframeBlock, RawIframeInline } from "./iframe-editor.js";
 import {
   useEffect,
   useRef,
@@ -226,6 +229,9 @@ export function LiveMarkdownEditor({
       element: rootRef.current,
       extensions: [
         StarterKit,
+        CalloutEditor,
+        RawIframeBlock,
+        RawIframeInline,
         Link.configure({ openOnClick: false, autolink: true }),
         Image.configure({ allowBase64: false }),
         TaskList,
@@ -236,6 +242,7 @@ export function LiveMarkdownEditor({
         TableCell,
         Placeholder.configure({ placeholder: "Start writing…" }),
         WikilinkLivePreview,
+        OutlineEditor,
         Markdown.configure({
           html: true,
           tightLists: true,

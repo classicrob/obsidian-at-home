@@ -1,3 +1,4 @@
+import { CalloutBlockquote, remarkCallouts } from "./callouts.js";
 import { useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown, {
@@ -105,11 +106,8 @@ function createHoverMarkdownComponents(
     ol: ({ node: _node, ...props }) => (
       <ol className="my-2 list-decimal space-y-1 pl-5" {...props} />
     ),
-    blockquote: ({ node: _node, ...props }) => (
-      <blockquote
-        className="my-2 border-l-2 border-border pl-3 text-muted-foreground"
-        {...props}
-      />
+    blockquote: (props) => (
+      <CalloutBlockquote {...props} className="my-2 border-l-2 border-border pl-3 text-muted-foreground" />
     ),
     a: ({ node: _node, href = "", children, ...props }) => {
       if (contentKind === "web" && renderUrlLink) {
@@ -290,7 +288,7 @@ export function HoverPreviewCard({
                   ) : null}
                   <div className="wikilink-backlink-context">
                     <ReactMarkdown
-                      remarkPlugins={[remarkGfm, remarkWikilinks, remarkBlockAnchors]}
+                      remarkPlugins={[remarkGfm, remarkCallouts, remarkWikilinks, remarkBlockAnchors]}
                       components={createHoverMarkdownComponents(
                         renderBacklinkNoteLink
                           ? (reference, children) =>
@@ -331,7 +329,7 @@ export function HoverPreviewCard({
             remarkPlugins={
               contentKind === "web"
                 ? [remarkGfm]
-                : [remarkGfm, remarkWikilinks, remarkBlockAnchors]
+                : [remarkGfm, remarkCallouts, remarkWikilinks, remarkBlockAnchors]
             }
             components={components}
             urlTransform={(url) =>

@@ -72,7 +72,7 @@ describe("Wikilinks preview", () => {
     const opener = app.fileOpeners[0]!;
     expect(opener).toMatchObject({
       id: "obsidian-wikilinks",
-      title: "Obsidian at Home",
+      title: "Wikilinks live editor",
       extensions: ["md", "markdown"],
     });
 
@@ -385,6 +385,53 @@ describe("Wikilinks preview", () => {
         expectedSha256: "external",
       });
       expect(await slot.findByText("Saved")).not.toBeNull();
+    } finally { slot.lifecycle.unmount(); }
+  }, 15_000);
+
+  it("renders allowlisted iframes and saves edited notes with the iframe markup byte-for-byte", async () => {
+    const app = await loadPluginApp(() => import("./app.js"));
+    const youtube = `<iframe width="560" height="315" src="https://www.youtube.com/embed/_IbTZBMHkmE?start=3622" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>`;
+    const loom = `<div style="position: relative; padding-bottom: 67.66917293233082%; height: 0;"><iframe src="https://www.loom.com/embed/4c1799d671f04c11810775d8df4783ed" frameborder="0" webkitallowfullscreen mozallowfullscreen allowfullscreen style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></iframe></div>`;
+    const inline = `See this file <iframe style="border: 1px solid rgba(0, 0, 0, 0.1);" width="800" height="450" src="https://www.figma.com/embed?embed_host=share&url=https%3A%2F%2Fwww.figma.com%2Ffile%2FOmKH" allowfullscreen></iframe> for parens.`;
+    const blocked = `<iframe src="https://aphyr.com/posts/302-clojure-from-the-ground-up-basic-types"></iframe>`;
+    const base = `---\nstatus: done\n---\n# Video note\n\n${youtube}\n\nFirst paragraph.\n\n${loom}\n\n${inline}\n\n${blocked}\n`;
+    const saves: Array<Record<string, unknown>> = [];
+    const slot = renderSlot(app.fileOpeners[0]!, {
+      path: "Iframe-note.md",
+      source: { kind: "host", threadId: null, environmentId: null, projectId: null },
+      Original: () => <div>Original</div>,
+    }, { rpc: {
+      open_markdown: () => ({ content: base, sha256: "old" }),
+      refresh_markdown: (input) => ({ changed: false, sha256: (input as { knownSha256: string }).knownSha256 }),
+      resolve_markdown_links: () => ({ links: [] }),
+      save_markdown: (input) => {
+        saves.push(input as unknown as Record<string, unknown>);
+        return { outcome: "written" as const, sha256: "saved-sha" };
+      },
+    } });
+    try {
+      const heading = await slot.findByRole("heading", { name: "Video note" });
+      const preview = heading.closest(".wikilinks-rendered-markdown")!;
+      const frames = Array.from(preview.querySelectorAll("iframe"));
+      expect(frames.map((frame) => new URL(frame.src).hostname)).toEqual(["www.youtube.com", "www.loom.com", "www.figma.com"]);
+      expect(frames[0]!.getAttribute("sandbox")).toContain("allow-scripts");
+      expect(frames[0]!.src).toBe("https://www.youtube.com/embed/_IbTZBMHkmE?start=3622");
+      expect((frames[0]!.parentElement as HTMLElement).style.aspectRatio).toMatch(/^1\.777/);
+      expect(preview.textContent).not.toContain("<iframe");
+      expect(preview.textContent).toContain("aphyr.com/posts/302-clojure-from-the-ground-up-basic-types");
+
+      fireEvent.click(heading);
+      const editor = await slot.findByRole("textbox");
+      expect(Array.from(editor.querySelectorAll("iframe")).map((frame) => new URL(frame.src).hostname))
+        .toEqual(["www.youtube.com", "www.loom.com", "www.figma.com"]);
+      expect(editor.textContent).not.toContain("<iframe");
+      const title = editor.querySelector("h1")!;
+      title.textContent = "Video notes, edited";
+      fireEvent.input(title);
+      await waitFor(() => expect(saves).toHaveLength(1), { timeout: 2500 });
+      // The editor drops a note's final newline on save for every note; everything else is kept.
+      expect(saves[0]!.content).toBe(base.replace("# Video note", "# Video notes, edited").replace(/\n$/, ""));
+      for (const markup of [youtube, loom, inline, blocked]) expect(saves[0]!.content).toContain(markup);
     } finally { slot.lifecycle.unmount(); }
   }, 15_000);
 

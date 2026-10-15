@@ -1,3 +1,5 @@
+import { containsIframe } from "./iframe-embed.js";
+
 export const WIKILINK_URL_PREFIX = "bb-wikilink:";
 
 function stripAngleBrackets(value: string): string {
@@ -217,4 +219,43 @@ export function mediaKind(reference: string): "image" | "video" | "audio" | null
 export function decodeWikimediaUrl(url: string): string | null {
   if (!url.startsWith(WIKIMEDIA_URL_PREFIX)) return null;
   try { return decodeURIComponent(url.slice(WIKIMEDIA_URL_PREFIX.length)); } catch { return null; }
+}
+
+export const IFRAME_EMBED_TAG = "wikilinks-iframe";
+
+/**
+ * Raw HTML that contains an `<iframe>` becomes a `wikilinks-iframe` element
+ * carrying the original markup, which the preview renders through the
+ * iframe allowlist. Inline `<iframe …>` and its `</iframe>` arrive as two
+ * html nodes; the closing one is dropped. Other raw HTML is left untouched.
+ */
+function transformIframes(node: MarkdownNode): void {
+  if (!node.children) return;
+  const nextChildren: MarkdownNode[] = [];
+  for (let index = 0; index < node.children.length; index++) {
+    const child = node.children[index]!;
+    if (child.type === "html" && typeof child.value === "string" && containsIframe(child.value)) {
+      const inline = node.type !== "root" && node.type !== "blockquote" && node.type !== "listItem";
+      let html = child.value;
+      const next = node.children[index + 1];
+      if (next?.type === "html" && /^<\/iframe\s*>$/i.test(next.value ?? "")) {
+        html += next.value;
+        index++;
+      }
+      nextChildren.push({
+        type: "iframeEmbed",
+        data: { hName: IFRAME_EMBED_TAG, hProperties: { dataHtml: html, dataInline: String(inline) } },
+      });
+      continue;
+    }
+    transformIframes(child);
+    nextChildren.push(child);
+  }
+  node.children = nextChildren;
+}
+
+export function remarkIframeEmbeds() {
+  return (tree: MarkdownNode) => {
+    transformIframes(tree);
+  };
 }

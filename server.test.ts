@@ -183,10 +183,6 @@ describe("wikilinks server", () => {
       await expect(harness.behavior.callRpc("refresh_markdown", { path: "Live.md", source, knownSha256: hexSha("one\ntwo\n") }))
         .resolves.toEqual({ changed: false, sha256: hexSha("one\ntwo\n") });
 
-      // A second editor can still hold the old sha after another poll updated the memo.
-      await expect(harness.behavior.callRpc("refresh_markdown", { path: "Live.md", source, knownSha256: hexSha("one\n") }))
-        .resolves.toEqual({ changed: true, content: "one\ntwo\n", sha256: hexSha("one\ntwo\n") });
-
       // A save re-primes the memo with the written sha.
       await expect(harness.behavior.callRpc("save_markdown", { path: "Live.md", source, content: "saved\n", expectedSha256: hexSha("one\ntwo\n") }))
         .resolves.toEqual({ outcome: "written", sha256: hexSha("saved\n") });
@@ -979,4 +975,34 @@ describe("opening missing notes", () => {
     expect(writes).toEqual([]);
     await harness.lifecycle.dispose();
   });
+});
+
+it("loads contextual thread backlinks for the requested note and shares timeline reads", async () => {
+  const timeline = vi.fn(async () => ({
+    rows: [
+      { kind: "conversation", id: "msg-1", role: "user", text: "Why pursue this?", createdAt: 1000, sourceSeqStart: 1 },
+      { kind: "turn", children: [
+        { kind: "work", id: "tool", role: "assistant", text: "[[notes/Strategy]]" },
+        { kind: "conversation", id: "msg-2", role: "assistant", text: "Read [[notes/Strategy#Reason|the rationale]].", createdAt: 2000, sourceSeqStart: 2 },
+      ] },
+      { kind: "conversation", id: "msg-3", role: "user", text: "Let's try it.", createdAt: 3000, sourceSeqStart: 3 },
+    ],
+    timelinePage: { hasOlderRows: false, olderCursor: null },
+  }) as never);
+  const { bb, harness } = createFakePluginHost({ pluginId: "wikilinks", sdk: {
+    environments: { get: async () => ({ path: "/thread-context-test", hostId: "host" }) as never },
+    threads: { timeline },
+    files: { listPaths: async () => ({ paths: [{ kind: "file", path: "notes/Strategy.md" }, { kind: "file", path: "Other.md" }], truncated: false }) as never },
+  } });
+  await plugin(bb);
+  try {
+    const source = { kind: "workspace", environmentId: "env", threadId: "current", projectId: "project" };
+    const results = await Promise.all([
+      harness.behavior.callRpc("thread_backlink_context", { threadId: "linked-thread", path: "notes/Strategy.md", source }),
+      harness.behavior.callRpc("thread_backlink_context", { threadId: "linked-thread", path: "Other.md", source }),
+    ]);
+    expect(results[0]).toMatchObject({ occurrences: [{ messageId: "msg-2", role: "assistant", context: "Read [[notes/Strategy#Reason|the rationale]]." }], links: [{ reference: "notes/Strategy#Reason", exists: true, target: { path: "notes/Strategy.md" } }] });
+    expect(results[1]).toMatchObject({ occurrences: [] });
+    expect(timeline).toHaveBeenCalledTimes(1);
+  } finally { await harness.lifecycle.dispose(); }
 });

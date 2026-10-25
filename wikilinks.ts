@@ -106,18 +106,34 @@ export function resolveWikilinkPath(
   );
   if (exactRoot) return { path: exactRoot, exists: true };
 
-  const requestedBasename = path.posix
-    .basename(directRequest)
-    .toLocaleLowerCase();
-  const basenameMatches = normalizedAvailable
-    .filter(
-      (candidate) =>
-        path.posix.basename(candidate).toLocaleLowerCase() === requestedBasename,
-    )
-    .sort(compareCandidates);
-  if (basenameMatches[0]) {
-    return { path: basenameMatches[0], exists: true };
+  // Otherwise the candidate sharing the longest trailing run of path segments
+  // wins, so `projects/app/notes/x/index` finds `docs/notes/x/index.md` in a
+  // workspace mounted below a vault, rather than whichever `index.md` is
+  // shallowest. A bare name is the one-segment case: shallowest, then sorted.
+  const requestedSegments = lowerDirect.split("/");
+  let best: string | undefined;
+  let bestShared = 0;
+  for (const candidate of normalizedAvailable) {
+    const segments = candidate.toLocaleLowerCase().split("/");
+    let shared = 0;
+    while (
+      shared < segments.length &&
+      shared < requestedSegments.length &&
+      segments[segments.length - 1 - shared] ===
+        requestedSegments[requestedSegments.length - 1 - shared]
+    ) {
+      shared += 1;
+    }
+    if (
+      shared > 0 &&
+      (shared > bestShared ||
+        (shared === bestShared && compareCandidates(candidate, best!) < 0))
+    ) {
+      best = candidate;
+      bestShared = shared;
+    }
   }
+  if (best) return { path: best, exists: true };
 
   const safeFallback =
     !relativeRequest.startsWith("../") && !path.posix.isAbsolute(relativeRequest)

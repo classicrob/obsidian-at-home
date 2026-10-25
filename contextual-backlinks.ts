@@ -51,10 +51,16 @@ export function createWikilinkPathResolver(
   const exact = new Map(
     normalizedPaths.map((candidate) => [normalizedCandidate(candidate), candidate]),
   );
-  const basenameWinner = new Map<string, string>();
+  // Every trailing run of path segments, keyed to its first candidate in
+  // resolution order, so the longest suffix a reference shares wins (the
+  // one-segment suffix is the basename), as in resolveWikilinkPath.
+  const suffixWinner = new Map<string, string>();
   for (const candidate of [...normalizedPaths].sort(compareCandidates)) {
-    const basename = normalizedCandidate(path.posix.basename(candidate));
-    if (!basenameWinner.has(basename)) basenameWinner.set(basename, candidate);
+    const segments = normalizedCandidate(candidate).split("/");
+    for (let start = 0; start < segments.length; start += 1) {
+      const suffix = segments.slice(start).join("/");
+      if (!suffixWinner.has(suffix)) suffixWinner.set(suffix, candidate);
+    }
   }
 
   return (reference: string, currentPath: string): string | null => {
@@ -72,12 +78,16 @@ export function createWikilinkPathResolver(
         path.posix.join(path.posix.dirname(currentPath), slashRequested),
       ),
     );
-    return (
+    const exactMatch =
       exact.get(normalizedCandidate(relative)) ??
-      exact.get(normalizedCandidate(direct)) ??
-      basenameWinner.get(normalizedCandidate(path.posix.basename(direct))) ??
-      null
-    );
+      exact.get(normalizedCandidate(direct));
+    if (exactMatch) return exactMatch;
+    const segments = normalizedCandidate(direct).split("/");
+    for (let start = 0; start < segments.length; start += 1) {
+      const winner = suffixWinner.get(segments.slice(start).join("/"));
+      if (winner) return winner;
+    }
+    return null;
   };
 }
 

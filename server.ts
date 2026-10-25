@@ -588,7 +588,9 @@ async function hostRootIsLocal(
       ]);
       // Hosts may hide dotfiles from their listings, so compare only the
       // entries both sides are certain to report.
-      const visible = (name: string) => !name.startsWith(".");
+      // The walk skips node_modules too, and hosts may leave it out of listings.
+      const visible = (name: string) =>
+        !name.startsWith(".") && name !== "node_modules";
       const localEntries = new Set(
         local
           .filter((entry) => visible(entry.name))
@@ -1520,6 +1522,61 @@ async function resolveLinks(
   return [...new Map(resolved.map((link) => [link.reference, link])).values()];
 }
 
+const WORKSPACE_ROOTS_TTL_MS = 60_000;
+const workspaceRootsCache = new Map<
+  string,
+  { expiresAt: number; promise: Promise<string[]> }
+>();
+
+/**
+ * The deepest project checkout or environment on `hostId` that contains
+ * `absolutePath`, so a file opened by absolute path resolves its links against
+ * its whole workspace, not only its own directory. Null when bb knows none.
+ */
+async function enclosingWorkspaceRoot(
+  bb: BbPluginApi,
+  hostId: string,
+  absolutePath: string,
+): Promise<string | null> {
+  const now = Date.now();
+  let cached = workspaceRootsCache.get(hostId);
+  if (!cached || cached.expiresAt <= now) {
+    const promise = (async () => {
+      const [projects, environments] = await Promise.all([
+        bb.sdk.projects.list().catch(() => []),
+        bb.sdk.environments.list({ hostId }).catch(() => []),
+      ]);
+      const roots = [
+        ...projects.flatMap((project) =>
+          (project.sources ?? [])
+            .filter((source) => source.hostId === hostId)
+            .map((source) => source.path),
+        ),
+        ...environments.map((environment) => environment.path),
+      ];
+      return [
+        ...new Set(
+          roots
+            .filter((root): root is string => !!root && isAbsoluteHostPath(root))
+            .map(normalizeHostPath),
+        ),
+      ];
+    })().catch(() => [] as string[]);
+    cached = { expiresAt: now + WORKSPACE_ROOTS_TTL_MS, promise };
+    workspaceRootsCache.set(hostId, cached);
+  }
+  const pathApi = hostPathApi(absolutePath);
+  const containing = (await cached.promise).filter((root) => {
+    const relative = pathApi.relative(root, absolutePath);
+    return (
+      relative !== "" &&
+      !relative.startsWith("..") &&
+      !pathApi.isAbsolute(relative)
+    );
+  });
+  return containing.sort((a, b) => b.length - a.length)[0] ?? null;
+}
+
 async function resolveOpenContext(
   bb: BbPluginApi,
   source: OpenerSource,
@@ -1584,12 +1641,16 @@ async function resolveOpenContext(
     }
     const absolutePath = normalizeHostPath(filePath);
     const pathApi = hostPathApi(absolutePath);
-    const rootPath = pathApi.dirname(absolutePath);
     const hostId =
       source.experimental_hostId ??
       (await bb.sdk.system.config()).primaryHostId;
     if (!hostId) throw new Error("This file has no host");
-    const currentRelativePath = pathApi.basename(absolutePath);
+    const rootPath =
+      (await enclosingWorkspaceRoot(bb, hostId, absolutePath)) ??
+      pathApi.dirname(absolutePath);
+    const currentRelativePath = pathApi
+      .relative(rootPath, absolutePath)
+      .replace(/\\/g, "/");
     return {
       absolutePath,
       currentRelativePath,

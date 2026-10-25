@@ -313,6 +313,51 @@ describe("wikilinks server", () => {
     await harness.lifecycle.dispose();
   });
 
+  it("resolves a host-path note's links against the project checkout containing it", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "wikilinks-host-root-"));
+    await mkdir(path.join(root, "docs/issues"), { recursive: true });
+    await mkdir(path.join(root, "docs/concepts"), { recursive: true });
+    await writeFile(path.join(root, "docs/issues/Issue.md"), "", "utf8");
+    await writeFile(path.join(root, "docs/concepts/Term.md"), "", "utf8");
+    const listing = async ({ path: requested }: { path?: string | undefined }) => {
+      const directory = requested ?? root;
+      return {
+      directory,
+      parent: null,
+      entries: (await readdir(directory, { withFileTypes: true })).map((entry) => ({
+        kind: entry.isDirectory() ? "directory" : "file",
+        name: entry.name,
+        path: path.join(directory, entry.name),
+      })),
+      } as never;
+    };
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "wikilinks",
+      sdk: {
+        projects: { list: async () => [{ sources: [{ hostId: "local-host", path: root }] }] as never },
+        environments: { list: async () => [] as never },
+        hosts: { directory: listing },
+      },
+    });
+    try {
+      await plugin(bb);
+      const resolved = await harness.behavior.callRpc("resolve_markdown_links", {
+        path: path.join(root, "docs/issues/Issue.md"),
+        source: { kind: "host", threadId: null, environmentId: null, projectId: null, experimental_hostId: "local-host" },
+        content: "[[vault/docs/concepts/Term]]",
+      });
+      expect(resolved).toEqual({
+        links: [{
+          reference: "vault/docs/concepts/Term",
+          target: { kind: "host", hostId: "local-host", path: path.join(root, "docs/concepts/Term.md") },
+          exists: true,
+        }],
+      });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("aborts a stalled refresh read within five seconds and allows the next read", async () => {
     vi.useFakeTimers();
     let readSignal: AbortSignal | undefined;

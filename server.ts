@@ -386,6 +386,10 @@ const threadStorageCache = new Map<
   string,
   { expiresAt: number; promise: Promise<{ storageRootPath: string; hostId: string }> }
 >();
+const hostWorkspaceRootsCache = new Map<
+  string,
+  { expiresAt: number; promise: Promise<string[]> }
+>();
 
 /** Memoizes a lookup whose answer barely changes but is asked on every hover. */
 function memoizeLookup<T>(
@@ -1456,23 +1460,7 @@ async function resolveTargetContext(
     };
   }
 
-  if (!isAbsoluteHostPath(target.path)) {
-    throw new Error("Host file paths must be absolute");
-  }
-  const absolutePath = normalizeHostPath(target.path);
-  const pathApi = hostPathApi(absolutePath);
-  const rootPath = pathApi.dirname(absolutePath);
-  return {
-    absolutePath,
-    currentRelativePath: pathApi.basename(absolutePath),
-    rootPath,
-    hostId: target.hostId,
-    targetFor: (relativePath) => ({
-      kind: "host",
-      hostId: target.hostId,
-      path: joinHostPath(rootPath, relativePath),
-    }),
-  };
+  return resolveHostContext(bb, target.hostId, target.path);
 }
 
 async function resolveLinks(
@@ -1518,6 +1506,52 @@ async function resolveLinks(
   ]);
   const resolved = [...resolvedWikilinks, ...resolvedMarkdownLinks];
   return [...new Map(resolved.map((link) => [link.reference, link])).values()];
+}
+
+async function resolveHostContext(
+  bb: BbPluginApi,
+  hostId: string,
+  filePath: string,
+): Promise<OpenContext> {
+  if (!isAbsoluteHostPath(filePath)) {
+    throw new Error("Host file paths must be absolute");
+  }
+  const absolutePath = normalizeHostPath(filePath);
+  let discoveryComplete = true;
+  const lookup = memoizeLookup(hostWorkspaceRootsCache, hostId, async () => {
+    const [projectsResult, environmentsResult] = await Promise.allSettled([
+      Promise.resolve().then(() => bb.sdk.projects.list()),
+      Promise.resolve().then(() => bb.sdk.environments.list({ hostId })),
+    ]);
+    discoveryComplete = projectsResult.status === "fulfilled" && environmentsResult.status === "fulfilled";
+    return [
+      ...(projectsResult.status === "fulfilled" ? projectsResult.value : []).flatMap((project) => project.sources
+        .filter((source) => source.hostId === hostId)
+        .map((source) => source.path)),
+      ...(environmentsResult.status === "fulfilled" ? environmentsResult.value : [])
+        .filter((environment) => environment.hostId === hostId)
+        .map((environment) => environment.path),
+    ].filter((root): root is string => typeof root === "string" && isAbsoluteHostPath(root))
+      .map(normalizeHostPath);
+  });
+  const roots = await lookup.catch(() => []);
+  if (!discoveryComplete && hostWorkspaceRootsCache.get(hostId)?.promise === lookup) {
+    hostWorkspaceRootsCache.delete(hostId);
+  }
+  const rootPath = roots
+    .filter((root) => relativePathWithinRoot(root, absolutePath) !== null)
+    .sort((a, b) => b.length - a.length)[0] ?? hostPathApi(absolutePath).dirname(absolutePath);
+  return {
+    absolutePath,
+    currentRelativePath: relativePathWithinRoot(rootPath, absolutePath)!,
+    rootPath,
+    hostId,
+    targetFor: (relativePath) => ({
+      kind: "host",
+      hostId,
+      path: joinHostPath(rootPath, relativePath),
+    }),
+  };
 }
 
 async function resolveOpenContext(
@@ -1579,28 +1613,11 @@ async function resolveOpenContext(
   }
 
   if (source.kind === "host") {
-    if (!isAbsoluteHostPath(filePath)) {
-      throw new Error("Host file paths must be absolute");
-    }
-    const absolutePath = normalizeHostPath(filePath);
-    const pathApi = hostPathApi(absolutePath);
-    const rootPath = pathApi.dirname(absolutePath);
     const hostId =
       source.experimental_hostId ??
       (await bb.sdk.system.config()).primaryHostId;
     if (!hostId) throw new Error("This file has no host");
-    const currentRelativePath = pathApi.basename(absolutePath);
-    return {
-      absolutePath,
-      currentRelativePath,
-      rootPath,
-      hostId,
-      targetFor: (relativePath) => ({
-        kind: "host",
-        hostId,
-        path: joinHostPath(rootPath, relativePath),
-      }),
-    };
+    return resolveHostContext(bb, hostId, filePath);
   }
 
   if (source.kind === "thread-storage") {
@@ -1644,6 +1661,7 @@ export default async function plugin(bb: BbPluginApi) {
   refreshMemo.clear();
   environmentCache.clear();
   threadStorageCache.clear();
+  hostWorkspaceRootsCache.clear();
   // Non-secret toggle read by the frontend through useSettings().
   bb.settings.define({
     documentBacklinks: {

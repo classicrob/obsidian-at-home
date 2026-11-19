@@ -3,6 +3,7 @@ import {
   extractWikilinkReferences,
   resolveWikilinkPath,
 } from "./wikilinks.js";
+import { createWikilinkPathResolver } from "./contextual-backlinks.js";
 
 describe("extractWikilinkReferences", () => {
   it("extracts plain and aliased links while ignoring embeds", () => {
@@ -43,6 +44,38 @@ describe("resolveWikilinkPath", () => {
     expect(
       resolveWikilinkPath("Version 1.2", "websim/Current note.md", paths),
     ).toEqual({ path: "websim/Version 1.2.md", exists: true });
+  });
+
+  it("prefers the longest matching path suffix over the shallowest basename", () => {
+    const nested = [
+      "docs/index.md",
+      "docs/attachments/first/index.md",
+      "docs/attachments/second/index.md",
+    ];
+    expect(
+      resolveWikilinkPath("projects/app/attachments/second/index", "docs/issues/a.md", nested),
+    ).toEqual({ path: "docs/attachments/second/index.md", exists: true });
+    expect(
+      resolveWikilinkPath("projects/app/attachments/second/index#Setup", "docs/issues/a.md", nested),
+    ).toEqual({ path: "docs/attachments/second/index.md", exists: true });
+  });
+
+  it("resolves the same way through the cached path resolver", () => {
+    const nested = [
+      "docs/index.md",
+      "docs/attachments/first/index.md",
+      "docs/attachments/second/index.md",
+    ];
+    const resolve = createWikilinkPathResolver(nested);
+    expect(resolve("projects/app/attachments/second/index", "docs/issues/a.md")).toBe("docs/attachments/second/index.md");
+    expect(resolve("index", "docs/issues/a.md")).toBe("docs/index.md");
+    expect(resolve("missing/nothing", "docs/issues/a.md")).toBeNull();
+  });
+
+  it("falls back to the shallowest basename when only the name matches", () => {
+    expect(
+      resolveWikilinkPath("elsewhere/Strategy", "Roadmap.md", paths),
+    ).toEqual({ path: "archive/Strategy.md", exists: true });
   });
 
   it("keeps missing notes clickable at an inferred same-folder path", () => {

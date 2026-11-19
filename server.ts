@@ -22,6 +22,7 @@ import { fetchWebPreview, type WebPreviewResult } from "./web-preview.js";
 import {
   cachedWikilinkPathResolver,
   extractContextualLinks,
+  missingNoteKey,
 } from "./contextual-backlinks.js";
 import {
   formatThinkingTrails,
@@ -1209,6 +1210,7 @@ async function buildBacklinkIndex(
             content,
             sourcePath,
             resolvePath,
+            { includeMissing: true },
           )) {
             const key = occurrence.targetPath.toLocaleLowerCase();
             const entries = backlinks.get(key) ?? [];
@@ -1306,7 +1308,12 @@ async function contextualBacklinks(
 }> {
   const cacheKey = `${context.hostId}\0${context.rootPath}`;
   const index = await backlinkIndex(bb, context, cacheKey);
-  const all = (index.get(context.currentRelativePath.toLocaleLowerCase()) ?? [])
+  // A note that doesn't exist yet still gathers meaning from the links that
+  // point at it, so unresolved links indexed under its name are merged in.
+  const all = [
+    ...(index.get(context.currentRelativePath.toLocaleLowerCase()) ?? []),
+    ...(index.get(missingNoteKey(context.currentRelativePath)) ?? []),
+  ]
     .filter(
       (entry) =>
         entry.sourcePath.toLocaleLowerCase() !==

@@ -23,6 +23,17 @@ function compareCandidates(left: string, right: string): number {
   );
 }
 
+/**
+ * Index key for links whose target note does not exist yet. Unresolved links
+ * are grouped by note name so a missing note's hover can still show the
+ * contexts that reference it.
+ */
+export function missingNoteKey(nameOrPath: string): string {
+  const requested = normalizeWikilinkReference(nameOrPath).split("#", 1)[0]!;
+  const basename = path.posix.basename(requested.replace(/\\/g, "/").trim());
+  return `missing:${basename.replace(/\.(?:md|markdown)$/i, "").toLocaleLowerCase()}`;
+}
+
 export type WikilinkPathResolver = (
   reference: string,
   currentPath: string,
@@ -111,6 +122,7 @@ export function extractContextualLinks(
   content: string,
   sourcePath: string,
   resolvePath: (reference: string, currentPath: string) => string | null,
+  options: { includeMissing?: boolean } = {},
 ): ContextualLinkOccurrence[] {
   const lines = parseMarkdownDocument(content).body.split(/\r?\n/);
   const headings: string[] = [];
@@ -155,7 +167,9 @@ export function extractContextualLinks(
       if (match.index > 0 && block[match.index - 1] === "!") continue;
       const reference = normalizeWikilinkReference(match[1]!);
       if (!reference) continue;
-      const targetPath = resolvePath(reference, sourcePath);
+      const targetPath =
+        resolvePath(reference, sourcePath) ??
+        (options.includeMissing ? missingNoteKey(reference) : null);
       if (!targetPath || seenTargets.has(targetPath)) continue;
       seenTargets.add(targetPath);
       occurrences.push({

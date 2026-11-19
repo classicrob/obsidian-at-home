@@ -21,6 +21,7 @@ Open a thread whose workspace contains your notes. If another Markdown opener is
 - **Edit Markdown:** Click document text to edit. Changes autosave; YAML frontmatter is preserved. External changes refresh automatically and merge with unsaved edits when they affect different lines. Overlapping changes offer **Reload** or **Overwrite**. Drafts and caret position survive editor remounts within the browser session.
 - **Find notes:** Type `[[` in the note editor or thread composer. Search tolerates typos and out-of-order terms. Use arrows to select, **Enter** or click to insert and open, **Tab** to insert only, and **Escape** to dismiss.
 - **Follow links:** Use `[[Note]]`, `[[folder/Note|Label]]`, or ordinary Markdown file links. Explicitly opening a missing note creates it and any parent folders; hovering does not.
+- **Host file links:** Notes opened by absolute path use the deepest registered project or worktree on that host as their workspace root, including recursive previews and backlinks. Standalone files use their own directory.
 - **Preview recursively:** Hover note links to read scrollable previews, then follow links inside them. Preview targets such as `[[Note#Heading]]` and `[[Note#^block-id]]` scroll to and highlight the target. Opening the full note does not yet scroll to its heading.
 - **Explore other content:** Website links show sanitized previews; `.tldraw` links show embedded canvas thumbnails. Interactive canvas editing requires a separate canvas opener.
 

@@ -1,11 +1,18 @@
 {
   "sdkMajor": 0,
-  "sdkVersion": "0.6.39",
+  "sdkVersion": "0.6.138",
   "artifactFormatVersion": 1,
   "pluginId": "wikilinks",
   "pluginVersion": "0.1.0",
   "builtWith": {
-    "bbVersion": "0.46.1-nightly.38298743325.1",
-    "pluginSdkVersion": "0.6.39"
-  }
+    "bbVersion": "0.49.1-nightly.42875372210.1",
+    "pluginSdkVersion": "0.6.138"
+  },
+  "runtimeSlots": [
+    "jsxRuntime",
+    "pluginSdkApp",
+    "react",
+    "reactDom",
+    "sonner"
+  ]
 }
